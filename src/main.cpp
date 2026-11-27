@@ -32,6 +32,8 @@ extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void *process, u
 #include "star/window_watch.h"
 #include "star/sha256.h"
 #include "star/options.h"
+#include "star/play_log.h"
+#include <cstdarg>
 #include "star/bindings.h"
 #if defined(STAR_HAS_LAUNCHER)
 #include "star/launcher.h"
@@ -306,7 +308,7 @@ namespace
             setDefaultEnv(variable, setting.c_str());
             applied += (applied.empty() ? "" : ", ") + name + " = " + value;
         }
-        say("settings from " + (haveFile ? file.string() : std::string("(no file)")) + ": " + (applied.empty() ? "nothing" : applied));
+        say("settings from " + (haveFile ? star::logName(file) : std::string("(no file)")) + ": " + (applied.empty() ? "nothing" : applied));
         if (!fallbacks.empty())
             say("settings without a line (the STAR preset's): " + fallbacks);
     }
@@ -501,6 +503,22 @@ namespace
     }
 }
 
+// raylib's log lines (declared here: raylib.h's names clash with Windows' in this file). As raylib prints them, but
+// for the one that names the working folder (the log gets posted with bug reports: no folders in it).
+extern "C" void SetTraceLogCallback(void (*callback)(int logLevel, const char *text, va_list args));
+namespace
+{
+    void raylibLog(int level, const char *text, va_list args)
+    {
+        char line[1024];
+        std::vsnprintf(line, sizeof(line), text, args);
+        if (std::strstr(line, "Working Directory"))
+            return;
+        static const char *const kLevels[] = {"", "TRACE: ", "DEBUG: ", "INFO: ", "WARNING: ", "ERROR: ", "FATAL: "};
+        std::printf("%s%s%c", level >= 1 && level <= 6 ? kLevels[level] : "", line, 10);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     // STAR 2026-11-23: F5 saves a state and F9 loads it (the runtime's quick slot), next to the program.
@@ -529,6 +547,15 @@ int main(int argc, char *argv[])
         }
     }
     const fs::path exeDir = fs::absolute(fs::path(argv[0])).parent_path();
+    if (!iso.empty())
+    {
+        std::error_code isoError;
+        iso = fs::absolute(iso, isoError); // (before the working folder may change)
+    }
+    // STAR 2026-11-27: started the ordinary way, the program keeps its own log (logs/play_last.log next to it) and
+    // works from its own folder (star/play_log.h).
+    star::startPlayLog(exeDir);
+    SetTraceLogCallback(&raylibLog);
     const fs::path cacheDir = exeDir / "cache";
     findSettingsFile(exeDir);
 #if defined(STAR_HAS_LAUNCHER)
@@ -574,7 +601,7 @@ int main(int argc, char *argv[])
     if (seconds > 0)
         startTimeLimit(seconds);
 
-    say(std::string(kTitle) + "; disc image " + iso.string());
+    say(std::string(kTitle) + ", version " + star::kVersion + "; disc image " + star::logName(iso));
     // a hidden (test) run uses the program's own defaults, whatever the player has chosen (STAR_TEST_SETTINGS=1: reads
     // the file all the same, to test the file's names)
     const bool readSettings = !hidden || std::getenv("STAR_TEST_SETTINGS") != nullptr;

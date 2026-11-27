@@ -408,7 +408,8 @@ bool PS2CdImage::open(const std::filesystem::path &imagePath)
         m_entries.clear();
         return false;
     }
-    std::cout << "[CDIMAGE] mounted " << imagePath.string() << " (" << m_entries.size() << " entries"
+    // (STAR: the file's name only; logs get posted with bug reports and folders can hold a person's name)
+    std::cout << "[CDIMAGE] mounted " << imagePath.filename().string() << " (" << m_entries.size() << " entries"
               << (m_image.isChd() ? ", CHD" : "") << ")" << std::endl;
     return true;
 }

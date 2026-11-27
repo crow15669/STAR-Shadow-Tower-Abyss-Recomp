@@ -66,12 +66,12 @@ body:
     attributes:
       label: The log
       description: |
-        Start the game with `Start-STAR.cmd`, make the problem happen, close the game, then drag the file `logs\play_last.log` into this box.
-        The log names the folders STAR and your disc image are in. If those folder names are private (your Windows user name, for example), open the file in Notepad and blank them out first.
+        Make the problem happen, close the game, then drag the file `logs\play_last.log` (next to STAR.exe) into this box. If you have played again since, it is `play_previous_1.log`.
+        The log records your graphics card and driver, your screen's resolution and refresh rate and your STAR settings. It holds no folder names from your PC.
   - type: textarea
     id: catch
     attributes:
       label: F1 catch (for something that flickers once and will not repeat)
       description: |
         If you had "Keep the last few seconds" switched on (Experimental) and pressed F1 right after it happened, there is a folder `logs\pictures_<number>`.
-        It is too large to upload whole (about 250 MB). Drag in its `list.txt` and `frames.txt` and two or three of the pictures that show the problem, and say that you have the rest.
+        It is too large to upload whole (about 250 MB). Drag in its `settings.txt`, `list.txt` and `frames.txt` and two or three of the pictures that show the problem, and say that you have the rest.

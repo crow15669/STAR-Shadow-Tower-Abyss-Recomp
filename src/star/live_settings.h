@@ -53,6 +53,9 @@ namespace star
     // Takes the starting values from the environment (which "STAR settings.ini" has already filled in) and adds the
     // Graphics page to the in-game menu. `settingsFile` is where changes are written back (empty: nowhere).
     void installSettingsMenu(const std::filesystem::path &settingsFile);
+    // Every setting as it is at this moment (the F2 menu may have changed them since the start), "name = value" lines,
+    // without the disc image's place: written into an F1 catch as settings.txt.
+    std::string settingsSnapshot();
     // After live().mouseKeyboard changed: the mouse is captured for the game, or left alone (game_fixes.cpp).
     void applyMouseKeyboard();
 }

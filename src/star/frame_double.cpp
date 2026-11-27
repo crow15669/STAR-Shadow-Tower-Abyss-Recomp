@@ -2,6 +2,7 @@
 
 #include "star/live_settings.h"
 #include "star/live_look.h"
+#include "star/play_log.h"
 
 #include "ps2_runtime.h"
 #include "runtime/ps2_async_vif.h"
@@ -590,6 +591,13 @@ namespace star
 
         void writeHistory(const char *folder)
         {
+            // (2026-11-27, the user's idea: the settings as they are at the catch; the log has only the start's)
+            if (FILE *out = std::fopen((std::string(folder) + "/settings.txt").c_str(), "w"))
+            {
+                std::fprintf(out, "STAR %s, the settings when F1 was pressed%c%c", kVersion, 10, 10);
+                std::fputs(settingsSnapshot().c_str(), out);
+                std::fclose(out);
+            }
             std::lock_guard<std::mutex> lock(g_historyMutex);
             if (FILE *out = std::fopen((std::string(folder) + "/frames.txt").c_str(), "w"))
             {

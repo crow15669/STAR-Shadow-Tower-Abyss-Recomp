@@ -3,8 +3,8 @@
     python -I tools/package.py [--name STAR-windows-x64]
 
 Output: build/release/<name>/ and build/release/<name>.zip. In it: the program (STAR.exe and its DLLs, resources),
-the settings file at its defaults, Start-STAR.cmd (starts it with a log), the README, the licence and the third-party
-licences. Nothing of the game, no logs, saves, caches or debug files.
+the settings file at its defaults, the README, the licence and the third-party licences. Nothing of the game, no
+logs, saves, caches or debug files. (The program writes its own log: no start script is needed.)
 
 Run it in a clean checkout: it refuses a settings file that holds somebody's own disc image, preset or controls.
 """
@@ -16,20 +16,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "build" / "bin"
 PROGRAM = ["STAR.exe", "pcsx2gs.dll", "SDL3.dll", "shaderc_shared.dll"]
-
-START = r"""@echo off
-rem Starts STAR and keeps a log of the run in logs\play_last.log: send that file with a bug report.
-rem The three runs before are kept as play_previous_1 to 3. This window closes when the game does.
-setlocal
-cd /d "%~dp0"
-if not exist "logs" mkdir "logs"
-if exist "logs\play_previous_2.log" move /y "logs\play_previous_2.log" "logs\play_previous_3.log" >nul
-if exist "logs\play_previous_1.log" move /y "logs\play_previous_1.log" "logs\play_previous_2.log" >nul
-if exist "logs\play_last.log" move /y "logs\play_last.log" "logs\play_previous_1.log" >nul
-echo STAR is running. Its log: %~dp0logs\play_last.log
-STAR.exe > "logs\play_last.log" 2>&1
-"""
-
 
 def fail(text):
     print(text)
@@ -62,7 +48,6 @@ def main(args):
         shutil.copy2(BIN / file, out / file)
     shutil.copytree(BIN / "resources", out / "resources")
     (out / "STAR settings.ini").write_bytes(settings_text().encode("utf-8"))
-    (out / "Start-STAR.cmd").write_bytes(START.replace("\n", "\r\n").encode("ascii"))
     shutil.copy2(ROOT / "README.md", out / "README.md")
     shutil.copy2(ROOT / "LICENSE", out / "LICENSE.txt")
     shutil.copytree(ROOT / "docs" / "licenses", out / "licenses")

@@ -818,7 +818,10 @@ void GSRenderer::RingSaveIfAsked()
 	}
 	if (list)
 		std::fclose(list);
-	std::fprintf(stderr, "[pictures] %zu of the last pictures written to %s%s (the newest at clock %.1f ms)\n", written, folder.c_str(),
+	// (STAR: the folder's own name only; logs get posted with bug reports and the folders above can hold a person's name)
+	const size_t folderSlash = folder.find_last_of("/\\");
+	std::fprintf(stderr, "[pictures] %zu of the last pictures written to %s%s (the newest at clock %.1f ms)\n", written,
+		folder.c_str() + (folderSlash == std::string::npos ? 0 : folderSlash + 1),
 		m_ring.empty() ? " (the recorder is off: nothing was kept)" : "", static_cast<double>(newest) / 1e6);
 	std::fflush(stderr);
 }

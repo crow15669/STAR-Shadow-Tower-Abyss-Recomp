@@ -46,7 +46,7 @@ STAR has so far been tested on one PC. Reports from other setups are welcome.
 
 1. Download the latest release from the
    [releases page](https://github.com/crow15669/STAR-Shadow-Tower-Abyss-Recomp/releases) and unzip it anywhere.
-2. Start `STAR.exe` (or `Start-STAR.cmd`, which also keeps a log for bug reports).
+2. Start `STAR.exe`.
 3. In the launcher, choose your disc image, pick a preset and press **Play**.
 
 Your choices are kept in `STAR settings.ini` next to the program.
@@ -76,9 +76,14 @@ More, with the reasons, in [docs/TECHNICAL_NOTES.md](docs/TECHNICAL_NOTES.md) (s
 
 ## Reporting a bug
 
-Start the game with `Start-STAR.cmd` and send the file `logs\play_last.log` with a description of what happened and
-where. For something that flickers once and will not repeat, switch on "Keep the last few seconds" under
-Experimental and press F1 right after it happens; the pictures are saved in `logs\pictures_<number>`.
+STAR writes a log of every run to `logs\play_last.log` next to the program, and keeps the three runs before it.
+Open an issue with that file and a description of what happened and where. The log records your graphics card and
+its driver, your screen's resolution and refresh rate and your STAR settings, which is what finding a bug needs. It
+holds no folder names from your PC.
+
+For something that flickers once and will not repeat, switch on "Keep the last few seconds" under Experimental and
+press F1 right after it happens; the pictures are saved in `logs\pictures_<number>`, with the settings as they were
+at that moment.
 
 ## Building from source
 

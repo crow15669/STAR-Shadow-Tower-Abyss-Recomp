@@ -50,11 +50,9 @@ namespace star
         // Rewrites the known names in the settings file, keeping every other line (the notes) as it is. A change made here
         // makes the player's own set (the launcher's Custom preset, as a change there does; the user's word, 2026-11-26).
         // Only called after a change.
-        void save()
+        // Every setting the menu knows, as it is now.
+        std::vector<std::pair<std::string, std::string>> currentValues()
         {
-            std::lock_guard<std::mutex> lock(g_fileMutex);
-            if (g_file.empty())
-                return;
             LiveSettings &s = live();
             std::vector<std::pair<std::string, std::string>> values = {
                 {"resolution", std::to_string(s.resolution.load())},
@@ -90,6 +88,15 @@ namespace star
                 const bool none = found == binds.end() || found->second.empty();
                 values.push_back({std::string("bind_") + one.id, none ? std::string("none") : bindings::encode(found->second)});
             }
+            return values;
+        }
+
+        void save()
+        {
+            std::lock_guard<std::mutex> lock(g_fileMutex);
+            if (g_file.empty())
+                return;
+            std::vector<std::pair<std::string, std::string>> values = currentValues();
             const options::Values current(values.begin(), values.end());
             values.push_back({"preset", options::presetId(-1)});
             values.push_back({"custom", options::encodeCustom(current)});
@@ -633,6 +640,14 @@ namespace star
                 save();
             savedLine(ui);
         }
+    }
+
+    std::string settingsSnapshot()
+    {
+        std::string text;
+        for (const auto &[name, value] : currentValues())
+            text += name + " = " + value + "\n";
+        return text;
     }
 
     void installSettingsMenu(const std::filesystem::path &settingsFile)

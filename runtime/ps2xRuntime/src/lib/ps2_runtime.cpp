@@ -3834,7 +3834,7 @@ void PS2Runtime::run()
             {
                 const std::filesystem::path old = logs / ("pictures_" + std::to_string(numbers[i]));
                 std::filesystem::remove_all(old, error);
-                std::fprintf(stderr, "[pictures] %s removed (%d are kept)%c", old.string().c_str(), keep, 10);
+                std::fprintf(stderr, "[pictures] logs/%s removed (%d are kept)%c", old.filename().string().c_str(), keep, 10);
             }
             const std::filesystem::path folder = logs / ("pictures_" + std::to_string(numbers.empty() ? 1 : numbers.back() + 1));
             std::filesystem::create_directories(folder, error);
@@ -3845,7 +3845,7 @@ void PS2Runtime::run()
             GSPcsx2Backend::SetOption("ring_save", text.c_str());
             if (g_ps2xLastPicturesHook)
                 g_ps2xLastPicturesHook(text.c_str()); // the game layer adds its own records to the folder
-            std::fprintf(stderr, "[pictures] asked for the last pictures in %s%c", text.c_str(), 10);
+            std::fprintf(stderr, "[pictures] asked for the last pictures in logs/%s%c", folder.filename().string().c_str(), 10);
         }
         if (!shortcutsOff && ps2x::hotkeys::pressed(Action::LoadState))
             ps2x::savestate::requestQuickLoad();

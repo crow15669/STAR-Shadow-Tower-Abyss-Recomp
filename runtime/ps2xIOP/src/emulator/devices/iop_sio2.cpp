@@ -399,7 +399,7 @@ namespace ps2x::iop::detail
         m_cards[0].attach(folder / "Mcd001.ps2", true);
         m_cards[1].attach(folder / "Mcd002.ps2", false);
         std::ostringstream message;
-        message << "[SIO2] memory card slot 1: " << (folder / "Mcd001.ps2").string()
+        message << "[SIO2] memory card slot 1: " << (folder.filename() / "Mcd001.ps2").generic_string() // (no folders above)
                 << (m_cards[0].present() ? "" : " (unavailable)");
         m_host.log(LogLevel::Info, message.str());
     }

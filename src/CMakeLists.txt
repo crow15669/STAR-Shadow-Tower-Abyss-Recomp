@@ -59,7 +59,7 @@ if(MSVC)
         COMPILE_OPTIONS "/Od" SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
-add_executable(star main.cpp star/sha256.cpp star/host_sampler.cpp star/game_fixes.cpp star/window_watch.cpp star/frame_double.cpp star/settings_menu.cpp star/debug_menu.cpp star/shadow_volumes.cpp star/options.cpp star/bindings.cpp)
+add_executable(star main.cpp star/sha256.cpp star/host_sampler.cpp star/game_fixes.cpp star/window_watch.cpp star/frame_double.cpp star/settings_menu.cpp star/debug_menu.cpp star/shadow_volumes.cpp star/options.cpp star/bindings.cpp star/play_log.cpp)
 set_target_properties(star PROPERTIES OUTPUT_NAME STAR RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 target_link_libraries(star PRIVATE star_game_code ps2_runtime)
 # The launcher (star/launcher.cpp): ImGui on the game's raylib window, as the runtime's F12 debugger (PS2X_ENABLE_DEBUG_UI).
@@ -82,6 +82,10 @@ if(MSVC)
     # /FORCE:MULTIPLE: WinAPI vs raylib CloseWindow clash. Large stack: deep guest call chains run on the host stack.
     # /LTCG: ps2_runtime is compiled with /GL in release mode (runtime/ps2xRuntime/cmake/ReleaseMode.cmake).
     target_link_options(star PRIVATE /FORCE:MULTIPLE /STACK:16777216 $<$<CONFIG:RelWithDebInfo>:/LTCG>)
+    # No console window behind the game (as the runtime's own runner): the program writes its log itself
+    # (star/play_log.cpp). A test's or a script's "STAR.exe > file" works as before.
+    target_link_options(star PRIVATE $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
+                                     $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>)
     target_link_libraries(star PRIVATE dbghelp winmm)
 endif()
 

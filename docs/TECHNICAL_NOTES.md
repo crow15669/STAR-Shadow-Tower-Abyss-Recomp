@@ -466,11 +466,16 @@ Switches used most (environment variables; hundreds more are named in code comme
 | `STAR_LAUNCHER_SHOT=<png>` (+ `_PAGE`, `_SCROLL`, `_PRESET`, `_SET`, `_CONTROLS`, `_BIND`) | Pictures and actions in the launcher |
 | `STAR_DEBUG_TEST=<frame>:give:<item>:<n>,<frame>:go:<map>:<x>:<y>:<z>,<frame>:creature:<kind>` | The Debug page's actions by script |
 
-The play log `build/bin/logs/play_last.log` is the first thing to read in any report: a `[stutter]` line for every
-late vblank says where the time went, and the `controls (...)` line lists the bindings in use.
+The play log is the first thing to read in any report: a `[stutter]` line for every late vblank says where the
+time went, the `controls (...)` line lists the bindings in use, and the start of it names the graphics card, its
+driver and the screen. The program writes it itself (`src/star/play_log.cpp`) to `logs/play_last.log` next to
+STAR.exe whenever its output is not already taken by a script or a test, keeps the three runs before, stops at 20 MB
+and prints file names without their folders (logs get posted in public; a folder can hold a person's name). Keep
+that rule when adding a log line: `star::logName(path)`.
 
-The F1 recorder (`record_pictures`) keeps the last few seconds of pictures; F1 writes them with `list.txt` and
-`frames.txt` (per game frame: the pictures' ids, the camera, every object and how it was paired). For a flicker
+The F1 recorder (`record_pictures`) keeps the last few seconds of pictures; F1 writes them with `settings.txt`
+(every setting as it was at that moment: the log only has the start's), `list.txt` and `frames.txt` (per game frame:
+the pictures' ids, the camera, every object and how it was paired). For a flicker
 seen once, that folder is the evidence: `tools/ringsteps.py` finds the odd pictures.
 
 **The mouse regression.** Before changing `mouseKeysPlay`, record a baseline: scripted clicks from a state with a
