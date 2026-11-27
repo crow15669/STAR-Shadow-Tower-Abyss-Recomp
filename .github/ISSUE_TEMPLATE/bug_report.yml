@@ -1,0 +1,77 @@
+name: Bug report
+description: Something in STAR looks, sounds or plays wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The more of this you can fill in, the faster a bug can be found.
+        STAR needs the English-patched Japanese disc (SLPS-25217); other versions are refused by the launcher and cannot be supported.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw or heard, and what you expected instead. A screenshot or short video helps a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: Where in the game, and how to make it happen again
+      description: The area, what you were doing, and whether it happens every time, sometimes, or happened only once.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: STAR version
+      placeholder: v0.9.0
+    validations:
+      required: true
+  - type: dropdown
+    id: preset
+    attributes:
+      label: Preset
+      options:
+        - STAR
+        - Remastered
+        - Original
+        - Custom
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings you changed
+      description: Anything you changed from the preset, in the launcher or the F2 menu. Does the problem go away with the Original preset?
+  - type: dropdown
+    id: input
+    attributes:
+      label: How do you play?
+      options:
+        - Controller
+        - Mouse and keyboard
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Graphics card, Windows version, screen refresh rate
+      placeholder: e.g. RTX 3060, Windows 11, 144 Hz
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: The log
+      description: |
+        Start the game with `Start-STAR.cmd`, make the problem happen, close the game, then drag the file `logs\play_last.log` into this box.
+        The log names the folders STAR and your disc image are in. If those folder names are private (your Windows user name, for example), open the file in Notepad and blank them out first.
+  - type: textarea
+    id: catch
+    attributes:
+      label: F1 catch (for something that flickers once and will not repeat)
+      description: |
+        If you had "Keep the last few seconds" switched on (Experimental) and pressed F1 right after it happened, there is a folder `logs\pictures_<number>`.
+        It is too large to upload whole (about 250 MB). Drag in its `list.txt` and `frames.txt` and two or three of the pictures that show the problem, and say that you have the rest.
