@@ -4,7 +4,8 @@ A native Windows version of **Shadow Tower Abyss** (FromSoftware, PlayStation 2,
 recompilation: the game's own PS2 program is translated into a PC program once, instead of being emulated while
 you play.
 
-STAR contains **no game data**. You need your own disc image of the game.
+STAR contains **no game data**. You need your own disc image of the game. It has only been tested with the
+English-patched version of SLPS-25217 (the Japanese release), and it accepts no other version.
 
 This is an unofficial fan project made with AI assistance. It is not affiliated with or endorsed by FromSoftware
 or Sony.
