@@ -1,0 +1,1295 @@
+#include "runtime/gs/gs_pcsx2_backend.h"
+#include "runtime/gs/gs_aspect.h"
+#include "runtime/gs/gs_shader_notice.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+#if defined(_WIN32) && __has_include("pcsx2gs_api.h")
+#include "pcsx2gs_api.h"
+#define PS2X_HAS_PCSX2_GS 1
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#elif defined(__linux__) && __has_include("pcsx2gs_api.h")
+#include "pcsx2gs_api.h"
+#define PS2X_HAS_PCSX2_GS 1
+#include <dlfcn.h>
+// The calling convention of the library's functions is the platform's default (__cdecl is Windows' name for it).
+#ifndef __cdecl
+#define __cdecl
+#endif
+#endif
+
+#if PS2X_HAS_PCSX2_GS
+static_assert(sizeof(GSVSyncRegs) == sizeof(Pcsx2GsPrivRegs), "GSVSyncRegs must match Pcsx2GsPrivRegs");
+
+#if !defined(_WIN32)
+// The game window is raylib's GLFW window, built into raylib (no GLFW headers on the include path): the few functions
+// used here, declared as GLFW does. glfwGetX11Window is weak: a GLFW built without X11 leaves it null.
+extern "C"
+{
+    struct GLFWwindow;
+    void glfwInitHint(int hint, int value);
+    int glfwGetPlatform(void);
+    void glfwGetFramebufferSize(GLFWwindow *window, int *width, int *height);
+    unsigned long glfwGetX11Window(GLFWwindow *window) __attribute__((weak));
+    bool IsWindowReady(void); // raylib
+}
+#endif
+
+namespace
+{
+#if defined(_WIN32)
+    using NativeWindow = HWND;
+#else
+    // An X11 window id, kept in a pointer as PCSX2's WindowInfo and Pcsx2GsOpenParams::hwnd do (0 = none).
+    using NativeWindow = void *;
+#endif
+
+    const Pcsx2GsApi *g_api = nullptr;
+    void(__cdecl *g_setAspect)(uint32_t) = nullptr; // pcsx2gs_set_aspect, when the DLL has it
+    void(__cdecl *g_setOption)(const char *, const char *) = nullptr; // pcsx2gs_set_option, when the DLL has it
+    int64_t(__cdecl *g_presentPoll)(void) = nullptr; // pcsx2gs_present_poll, when the DLL has it
+    void(__cdecl *g_setOverlay)(const float *, const uint32_t *, uint32_t) = nullptr; // pcsx2gs_set_overlay, when the DLL has it
+    void(__cdecl *g_setOverlayText)(const float *, const uint32_t *, const char *, uint32_t) = nullptr; // pcsx2gs_set_overlay_text
+    void(__cdecl *g_setScreen)(const Pcsx2GsScreenItem *, uint32_t, const char *, uint32_t) = nullptr; // pcsx2gs_set_screen
+    int(__cdecl *g_setApi)(const char *, void *, uint32_t, uint32_t) = nullptr; // pcsx2gs_set_api, when the DLL has it
+    const std::chrono::steady_clock::time_point g_processStart = std::chrono::steady_clock::now();
+    NativeWindow g_parent = nullptr;
+    NativeWindow g_child = nullptr;
+    std::atomic<uint64_t> g_presents{0u};
+    std::atomic<uint32_t> g_clientWidth{0u};
+    std::atomic<float> g_pendingScale{0.0f}; // SetScale: > 0 until the GS thread hands it over
+    std::atomic<uint32_t> g_clientHeight{0u};
+
+    // SetGraphicsApi's steps: Window (the main thread makes the new child window, under the old one), Reopen (the GS
+    // thread reopens into it at its next present), Swap (the main thread drops the old window, showing the new one).
+    enum class ApiStep : int
+    {
+        Idle,
+        Window,
+        Reopen,
+        Swap
+    };
+    std::atomic<ApiStep> g_apiStep{ApiStep::Idle};
+    std::atomic<int> g_apiResult{1};
+    std::mutex g_apiMutex;
+    std::string g_apiWanted; // guarded by g_apiMutex
+    NativeWindow g_newChild = nullptr; // made in Window, handed over by the steps' order (acquire / release)
+    bool g_hostUiVisible = false; // SetHostUiVisible (main thread)
+    bool g_childHidden = false;   // main thread: the child window is hidden (for the host UI or the shader notice)
+
+    // The "Preparing shaders" notice (runtime/gs/gs_shader_notice.h). The GS thread starts it before its first open and
+    // finishes it at its first present; the main thread shows it in between (HostTick). Stage 0 = not yet, 1 = open
+    // under way, 2 = done: after that HostTick reads only the stage.
+    std::atomic<int> g_noticeStage{0};
+    std::atomic<bool> g_noticeWasShown{false};
+    std::mutex g_noticeMutex;
+    ps2x::gs::ShaderNotice g_notice;          // guarded by g_noticeMutex
+    ps2x::gs::ShaderIndexSet g_noticeIndexes; // guarded by g_noticeMutex
+    std::filesystem::path g_noticeCacheDir;   // guarded by g_noticeMutex
+    bool g_noticeShowing = false;             // main thread
+    double g_noticeLastPoll = 0.0;            // main thread
+
+    std::filesystem::path exeDirectory()
+    {
+#if defined(_WIN32)
+        wchar_t path[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        return length ? std::filesystem::path(path).parent_path() : std::filesystem::current_path();
+#else
+        std::error_code ec;
+        const std::filesystem::path path = std::filesystem::read_symlink("/proc/self/exe", ec);
+        return ec ? std::filesystem::current_path() : path.parent_path();
+#endif
+    }
+
+    // KAMITE_HOME: the writable play folder when set (the executable's folder may then be read-only, as in an
+    // AppImage); empty when not set. Linux only, like src/kamite/paths.cpp: on Windows the play folder is always the
+    // exe's, so the shader cache stays beside GHR.ini whatever the environment holds.
+    std::filesystem::path playFolder()
+    {
+#if defined(_WIN32)
+        return {};
+#else
+        const char *value = std::getenv("KAMITE_HOME");
+        return (value && *value) ? std::filesystem::path(value) : std::filesystem::path();
+#endif
+    }
+
+    std::string utf8(const std::filesystem::path &path)
+    {
+        const std::u8string text = path.u8string();
+        return std::string(reinterpret_cast<const char *>(text.data()), text.size());
+    }
+
+    int envInt(const char *name, int fallback)
+    {
+        const char *value = std::getenv(name);
+        return (value && *value) ? std::atoi(value) : fallback;
+    }
+
+    double secondsNow()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
+    }
+
+    bool noticeEnabled()
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_SHADER_NOTICE");
+            if (value && *value)
+                return *value != '0';
+#if defined(_WIN32)
+            // Not tried on Windows: there a window presenting while it fills the monitor skips the composition that
+            // puts the child on top, and the launcher hand-off's cover sits over it (host_window_win32.cpp).
+            return false;
+#else
+            return true;
+#endif
+        }();
+        return enabled;
+    }
+
+    // The shader cache indexes in PCSX2's cache folder as they are now: a stat and the header bytes of each.
+    void sampleShaderIndexes(const std::filesystem::path &dir, ps2x::gs::ShaderIndexSample (&out)[ps2x::gs::kShaderIndexCount])
+    {
+        for (size_t i = 0; i < ps2x::gs::kShaderIndexCount; ++i)
+        {
+            const std::filesystem::path path = dir / ps2x::gs::kShaderIndexes[i].name;
+            std::error_code ec;
+            const uintmax_t size = std::filesystem::file_size(path, ec);
+            out[i] = {};
+            if (ec)
+                continue;
+            out[i].exists = true;
+            out[i].size = size;
+            std::ifstream file(path, std::ios::binary);
+            out[i].head.resize(ps2x::gs::kShaderIndexes[i].headerBytes);
+            file.read(out[i].head.data(), static_cast<std::streamsize>(out[i].head.size()));
+            out[i].head.resize(file ? out[i].head.size() : static_cast<size_t>(std::max<std::streamsize>(0, file.gcount())));
+        }
+    }
+
+    // GS thread, before the GS's first open (later opens, e.g. a graphics API switch, are not counted).
+    void noticeBegin(const std::filesystem::path &cacheDir)
+    {
+        if (g_noticeStage.load(std::memory_order_relaxed) != 0)
+            return;
+        ps2x::gs::ShaderIndexSample baseline[ps2x::gs::kShaderIndexCount];
+        sampleShaderIndexes(cacheDir, baseline);
+        {
+            std::lock_guard<std::mutex> lock(g_noticeMutex);
+            g_noticeCacheDir = cacheDir;
+            g_noticeIndexes.begin(baseline);
+            // PS2X_SHADER_NOTICE_DELAY_MS: when it shows (tests: 0, so the shown path always runs).
+            if (const char *delay = std::getenv("PS2X_SHADER_NOTICE_DELAY_MS"); delay && *delay)
+                g_notice.setShowAfter(std::max(0, std::atoi(delay)) / 1000.0);
+            g_notice.start(secondsNow());
+        }
+        g_noticeStage.store(1, std::memory_order_release);
+    }
+
+    // GS thread: the first frame is out (or the open failed). The last count, then the log line.
+    void noticeEnd()
+    {
+        if (g_noticeStage.load(std::memory_order_relaxed) != 1)
+            return;
+        std::string line;
+        {
+            std::lock_guard<std::mutex> lock(g_noticeMutex);
+            ps2x::gs::ShaderIndexSample samples[ps2x::gs::kShaderIndexCount];
+            sampleShaderIndexes(g_noticeCacheDir, samples);
+            g_noticeIndexes.observe(samples);
+            g_notice.setCompiled(g_noticeIndexes.compiled());
+            g_notice.finish(secondsNow());
+            line = g_notice.logLine();
+            if (g_noticeWasShown.load(std::memory_order_relaxed))
+                line += " (the notice was shown)";
+        }
+        g_noticeStage.store(2, std::memory_order_release);
+        std::fprintf(stderr, "%s\n", line.c_str());
+        std::fflush(stderr);
+    }
+
+#if defined(_WIN32)
+    // The child window only shows the GS output: mouse input goes through to the game window (HTTRANSPARENT works
+    // because both belong to the main thread, which also pumps this window's messages).
+    LRESULT CALLBACK ChildProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+    {
+        switch (msg)
+        {
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+        case WM_ERASEBKGND:
+            return 1;
+        default:
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+    }
+#else
+    // Xlib, opened at run time (GLFW opens it the same way, so GHR has no link to libX11): the calls the child window
+    // needs, with Xlib's own types reduced to what they are (a Display pointer, XIDs as unsigned long).
+    struct X11
+    {
+        using Display = struct _XDisplay;
+        using XID = unsigned long;
+        int (*XInitThreads)() = nullptr;
+        Display *(*XOpenDisplay)(const char *) = nullptr;
+        XID (*XCreateSimpleWindow)(Display *, XID, int, int, unsigned, unsigned, unsigned, unsigned long,
+                                   unsigned long) = nullptr;
+        int (*XSetWindowBackgroundPixmap)(Display *, XID, XID) = nullptr;
+        int (*XMapWindow)(Display *, XID) = nullptr;
+        int (*XUnmapWindow)(Display *, XID) = nullptr;
+        int (*XResizeWindow)(Display *, XID, unsigned, unsigned) = nullptr;
+        int (*XLowerWindow)(Display *, XID) = nullptr;
+        int (*XDestroyWindow)(Display *, XID) = nullptr;
+        int (*XSync)(Display *, int) = nullptr;
+        // libXext's SHAPE extension, when there: an empty input region, so the pointer goes through the child to the
+        // game window as if the child were not there (Windows' HTTRANSPARENT). Without it, pointer events still reach
+        // GLFW (the child selects none, so X hands them to the parent), but GLFW sees the pointer leave its window.
+        void (*XShapeCombineRectangles)(Display *, XID, int, int, int, void *, int, int, int) = nullptr;
+        Display *window = nullptr; // the main thread's connection: makes, sizes, shows and drops the child windows
+        Display *present = nullptr; // the GS thread's: PCSX2's Vulkan surface (pcsx2gs_set_display)
+
+        XID id(NativeWindow w) const { return static_cast<XID>(reinterpret_cast<uintptr_t>(w)); }
+
+        // Main thread, once: false (and a log line) when Xlib or the display is missing.
+        bool Open()
+        {
+            static const bool ok = [this]
+            {
+                void *lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+                if (!lib)
+                {
+                    std::fprintf(stderr, "[gs] PCSX2 GS: libX11.so.6 did not load (%s)\n", dlerror());
+                    return false;
+                }
+                bool all = true;
+                auto load = [&](auto &fn, const char *name)
+                {
+                    fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, name));
+                    all = all && fn != nullptr;
+                };
+                load(XInitThreads, "XInitThreads");
+                load(XOpenDisplay, "XOpenDisplay");
+                load(XCreateSimpleWindow, "XCreateSimpleWindow");
+                load(XSetWindowBackgroundPixmap, "XSetWindowBackgroundPixmap");
+                load(XMapWindow, "XMapWindow");
+                load(XUnmapWindow, "XUnmapWindow");
+                load(XResizeWindow, "XResizeWindow");
+                load(XLowerWindow, "XLowerWindow");
+                load(XDestroyWindow, "XDestroyWindow");
+                load(XSync, "XSync");
+                if (!all)
+                {
+                    std::fprintf(stderr, "[gs] PCSX2 GS: libX11.so.6 lacks a function it needs\n");
+                    return false;
+                }
+                if (void *ext = dlopen("libXext.so.6", RTLD_NOW | RTLD_LOCAL))
+                    XShapeCombineRectangles = reinterpret_cast<decltype(XShapeCombineRectangles)>(
+                        dlsym(ext, "XShapeCombineRectangles"));
+                // GLFW has already made Xlib thread-safe (its X11 start calls XInitThreads); asking again is harmless.
+                XInitThreads();
+                // Connections of their own (GLFW's stays GLFW's): the X server owns the windows, so a window made on
+                // one connection can be presented into from another. $DISPLAY, as GLFW opens it.
+                window = XOpenDisplay(nullptr);
+                present = XOpenDisplay(nullptr);
+                if (!window || !present)
+                {
+                    std::fprintf(stderr, "[gs] PCSX2 GS: the X11 display did not open (DISPLAY=%s)\n",
+                                 std::getenv("DISPLAY") ? std::getenv("DISPLAY") : "");
+                    return false;
+                }
+                return true;
+            }();
+            return ok;
+        }
+    } g_x11;
+#endif
+
+    // PS2X_GIF_DUMP=<start seconds>:<fields>:<file>: the GIF stream sent to PCSX2's GS, from the first vsync after
+    // <start seconds> of run time, for <fields> fields. Records (little endian): 'M' u32 size + GS local memory at the
+    // start, 'G' u32 size + GIF qwords as sent, 'V' u32 size + u64 field + GSVSyncRegs at each vsync.
+    // tools/gs/gif_dump.py lists the draws.
+    struct GifDump
+    {
+        double startSeconds = 0.0;
+        uint64_t fields = 0u;
+        std::FILE *file = nullptr;
+        bool active = false;
+        bool done = false;
+    };
+
+    GifDump &gifDump()
+    {
+        static GifDump dump = []
+        {
+            GifDump result;
+            const char *value = std::getenv("PS2X_GIF_DUMP");
+            unsigned long long fields = 0u;
+            char path[512]{};
+            if (value && std::sscanf(value, "%lf:%llu:%511[^\n]", &result.startSeconds, &fields, path) == 3)
+            {
+                result.fields = fields;
+                result.file = std::fopen(path, "wb");
+            }
+            result.done = result.file == nullptr;
+            return result;
+        }();
+        return dump;
+    }
+
+    std::mutex g_gifDumpRequest;
+
+    void gifDumpRecord(char type, const void *data, uint32_t size, const void *prefix = nullptr, uint32_t prefixSize = 0u)
+    {
+        GifDump &dump = gifDump();
+        const uint32_t total = size + prefixSize;
+        std::fputc(type, dump.file);
+        std::fwrite(&total, 4, 1, dump.file);
+        if (prefixSize)
+            std::fwrite(prefix, 1, prefixSize, dump.file);
+        std::fwrite(data, 1, size, dump.file);
+    }
+
+}
+
+// F10 (ps2_runtime.cpp): a PS2X_GIF_DUMP of the next <fields> fields into <path>, started at the next vsync. Nothing
+// happens while a dump is still being written.
+void ps2xRequestGifDump(uint32_t fields, const char *path)
+{
+    std::lock_guard<std::mutex> lock(g_gifDumpRequest);
+    GifDump &dump = gifDump();
+    if (!dump.done && dump.file)
+        return;
+    std::FILE *file = std::fopen(path, "wb");
+    if (!file)
+        return;
+    dump.file = file;
+    dump.fields = fields;
+    dump.startSeconds = 0.0;
+    dump.active = false;
+    dump.done = false;
+    std::fprintf(stderr, "[gs] GIF dump of the next %u fields requested: %s\n", fields, path);
+}
+
+namespace
+{
+    // Bytes per pixel in a host <-> local transfer (PCSX2's trbpp).
+    uint32_t transferBits(uint32_t psm)
+    {
+        switch (psm)
+        {
+        case 0x00u: case 0x30u: return 32u;
+        case 0x01u: case 0x31u: return 24u;
+        case 0x02u: case 0x0Au: case 0x32u: case 0x3Au: return 16u;
+        case 0x13u: case 0x1Bu: return 8u;
+        case 0x14u: case 0x24u: case 0x2Cu: return 4u;
+        default: return 32u;
+        }
+    }
+}
+
+// PS2X_FRAME_TIMES with PCSX2's GS: one row per present (vsync), in the columns of the host loop's file (ps2_runtime.cpp)
+// so tools/pacing_summary.py and image_cadence.py read it. The image is not hashed (a GPU readback per frame): a field
+// counts as a new image when the game sent drawing data (>= 4 KB of GIF) since the previous one.
+bool ps2xHostVsync(std::chrono::steady_clock::time_point &lastVblank, std::chrono::nanoseconds &period) noexcept; // Kernel/host_vsync.cpp
+
+void GSPcsx2Backend::WriteFrameTime(std::chrono::steady_clock::time_point presentStart)
+{
+    static std::FILE *file = []() -> std::FILE *
+    {
+        const char *path = std::getenv("PS2X_FRAME_TIMES");
+        std::FILE *f = (path && *path) ? std::fopen(path, "w") : nullptr;
+        if (f)
+            std::fputs("seconds,field,source_sequence,render_revision,new_source,interval_ms,submit_ms,swap_ms,shared,hash_valid,image_hash,image_changed,start_phase_ms,end_phase_ms\n", f);
+        return f;
+    }();
+    if (!file)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - g_processStart).count();
+    const double interval = m_lastPresent.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(now - m_lastPresent).count() : 0.0;
+    const double present = std::chrono::duration<double, std::milli>(now - presentStart).count();
+    const uint64_t drawn = m_gifBytes - m_gifBytesAtPresent;
+    // Where the present started and ended within the monitor's refresh (ms after its last vblank; -1 = unknown).
+    double startPhase = -1.0;
+    double endPhase = -1.0;
+    std::chrono::steady_clock::time_point lastVblank;
+    std::chrono::nanoseconds period{};
+    if (ps2xHostVsync(lastVblank, period) && period.count() > 0)
+    {
+        auto phase = [&](std::chrono::steady_clock::time_point t)
+        {
+            const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t - lastVblank).count() % period.count();
+            return static_cast<double>(ns < 0 ? ns + period.count() : ns) / 1e6;
+        };
+        startPhase = phase(presentStart);
+        endPhase = phase(now);
+    }
+    std::fprintf(file, "%.6f,%llu,%llu,0,-1,%.4f,%.4f,0,0,1,%llu,%d,%.3f,%.3f\n", seconds, static_cast<unsigned long long>(m_fields + 1u),
+                 static_cast<unsigned long long>(m_fields + 1u), interval, present, static_cast<unsigned long long>(drawn),
+                 drawn >= 4096u ? 1 : 0, startPhase, endPhase);
+    m_lastPresent = now;
+    m_gifBytesAtPresent = m_gifBytes;
+}
+
+#if !defined(_WIN32)
+namespace
+{
+    void(__cdecl *g_setDisplay)(void *) = nullptr; // pcsx2gs_set_display (Linux)
+
+    // PS2X_GS_RENDERER asks for PCSX2's GS (the default), whether or not the library is there.
+    bool rendererWanted()
+    {
+        const char *value = std::getenv("PS2X_GS_RENDERER");
+        std::string name = (value && *value) ? value : "pcsx2";
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return name == "pcsx2";
+    }
+
+    bool hasX11Display()
+    {
+        const char *display = std::getenv("DISPLAY");
+        return display && *display;
+    }
+
+    constexpr int kGlfwPlatform = 0x00050003;    // GLFW_PLATFORM
+    constexpr int kGlfwPlatformX11 = 0x00060004; // GLFW_PLATFORM_X11
+}
+
+void GSPcsx2Backend::BeforeHostWindow()
+{
+    // The GS presents into an X11 child window of the game window, so GLFW must be on X11. Without $DISPLAY (a
+    // Wayland session with no Xwayland) GLFW keeps its own choice and Requested() turns the PCSX2 GS down.
+    if (rendererWanted() && hasX11Display())
+        glfwInitHint(kGlfwPlatform, kGlfwPlatformX11);
+}
+#else
+void GSPcsx2Backend::BeforeHostWindow() {}
+#endif
+
+bool GSPcsx2Backend::Requested()
+{
+    static const bool requested = []
+    {
+#if defined(_WIN32)
+        // The default since PROGRESS §85; PS2X_GS_RENDERER=nativo (config.ini Renderizador=nativo) keeps the port's GS.
+        const char *value = std::getenv("PS2X_GS_RENDERER");
+        std::string name = (value && *value) ? value : "pcsx2";
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (name != "pcsx2")
+            return false;
+#else
+        if (!rendererWanted())
+            return false;
+        // Linux: the GS needs an X11 window. A game window already made on another platform (Wayland) has none, and
+        // without $DISPLAY none can be made: the built-in GS then (gs_threaded_backend.cpp MakeDefault).
+        if (!hasX11Display() || (IsWindowReady() && glfwGetPlatform() != kGlfwPlatformX11) || !glfwGetX11Window)
+        {
+            std::fprintf(stderr, "[gs] PS2X_GS_RENDERER=pcsx2 but the game window is not an X11 one (DISPLAY=%s); "
+                                 "using the built-in GS\n", std::getenv("DISPLAY") ? std::getenv("DISPLAY") : "");
+            return false;
+        }
+        const std::filesystem::path library = exeDirectory() / "libpcsx2gs.so";
+        void *module = dlopen(library.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!module)
+        {
+            std::fprintf(stderr, "[gs] PS2X_GS_RENDERER=pcsx2 but %s did not load (%s); using the built-in GS\n",
+                         library.c_str(), dlerror());
+            return false;
+        }
+        // dlsym answers what GetProcAddress does on Windows; the code below is the same on both.
+        const auto GetProcAddress = [](void *handle, const char *name) { return dlsym(handle, name); };
+        g_setDisplay = reinterpret_cast<void(__cdecl *)(void *)>(GetProcAddress(module, "pcsx2gs_set_display"));
+#endif
+#if defined(_WIN32)
+        const std::filesystem::path dll = exeDirectory() / "pcsx2gs.dll";
+        HMODULE module = LoadLibraryW(dll.c_str());
+        if (!module)
+        {
+            std::fprintf(stderr, "[gs] PS2X_GS_RENDERER=pcsx2 but %s did not load (error %lu); using the built-in GS\n",
+                         dll.string().c_str(), GetLastError());
+            return false;
+        }
+#endif
+        const auto getApi = reinterpret_cast<Pcsx2GsGetApiFn>(GetProcAddress(module, "pcsx2gs_get_api"));
+        g_api = getApi ? getApi(PCSX2GS_API_VERSION) : nullptr;
+        g_setAspect = reinterpret_cast<void(__cdecl *)(uint32_t)>(GetProcAddress(module, "pcsx2gs_set_aspect"));
+        g_setOption = reinterpret_cast<void(__cdecl *)(const char *, const char *)>(GetProcAddress(module, "pcsx2gs_set_option"));
+        g_presentPoll = reinterpret_cast<int64_t(__cdecl *)(void)>(GetProcAddress(module, "pcsx2gs_present_poll"));
+        g_setOverlay = reinterpret_cast<void(__cdecl *)(const float *, const uint32_t *, uint32_t)>(GetProcAddress(module, "pcsx2gs_set_overlay"));
+        g_setOverlayText = reinterpret_cast<void(__cdecl *)(const float *, const uint32_t *, const char *, uint32_t)>(
+            GetProcAddress(module, "pcsx2gs_set_overlay_text"));
+        g_setScreen = reinterpret_cast<void(__cdecl *)(const Pcsx2GsScreenItem *, uint32_t, const char *, uint32_t)>(
+            GetProcAddress(module, "pcsx2gs_set_screen"));
+        g_setApi = reinterpret_cast<int(__cdecl *)(const char *, void *, uint32_t, uint32_t)>(GetProcAddress(module, "pcsx2gs_set_api"));
+        if (!g_api)
+        {
+            std::fprintf(stderr, "[gs] pcsx2gs.dll has no matching pcsx2gs_get_api (version %u); using the built-in GS\n",
+                         PCSX2GS_API_VERSION);
+            return false;
+        }
+#if !defined(_WIN32)
+        if (!g_setDisplay)
+        {
+            g_api = nullptr;
+            std::fprintf(stderr, "[gs] libpcsx2gs.so has no pcsx2gs_set_display; using the built-in GS\n");
+            return false;
+        }
+        std::fprintf(stderr, "[gs] renderer: PCSX2 GS (libpcsx2gs.so, Vulkan on X11)\n");
+        return true;
+#endif
+        std::fprintf(stderr, "[gs] renderer: PCSX2 GS (pcsx2gs.dll)\n");
+        return true;
+    }();
+    return requested;
+}
+
+namespace
+{
+#if !defined(_WIN32)
+    // The game window's size in pixels (its framebuffer: what the child covers).
+    void parentSize(uint32_t &width, uint32_t &height)
+    {
+        int w = 0, h = 0;
+        glfwGetFramebufferSize(static_cast<GLFWwindow *>(g_parent), &w, &h);
+        width = static_cast<uint32_t>(std::max(1, w));
+        height = static_cast<uint32_t>(std::max(1, h));
+    }
+
+    // Main thread: an X11 child window of the game window the GS presents into, the size of the parent. It selects no
+    // events, so input goes to the game window; no background, so the X server never clears it over the picture.
+    NativeWindow makeChild(uint32_t &width, uint32_t &height)
+    {
+        parentSize(width, height);
+        const unsigned long parent = glfwGetX11Window(static_cast<GLFWwindow *>(g_parent));
+        if (!parent)
+        {
+            std::fprintf(stderr, "[gs] PCSX2 GS: the game window has no X11 window\n");
+            return nullptr;
+        }
+        const unsigned long child = g_x11.XCreateSimpleWindow(g_x11.window, parent, 0, 0, width, height, 0, 0, 0);
+        if (!child)
+        {
+            std::fprintf(stderr, "[gs] PCSX2 GS: child window creation failed\n");
+            return nullptr;
+        }
+        g_x11.XSetWindowBackgroundPixmap(g_x11.window, child, 0ul); // None
+        if (g_x11.XShapeCombineRectangles)
+            g_x11.XShapeCombineRectangles(g_x11.window, child, 2 /* ShapeInput */, 0, 0, nullptr, 0, 0 /* ShapeSet */,
+                                          0 /* Unsorted */);
+        g_x11.XMapWindow(g_x11.window, child);
+        // Made on the server before the GS thread makes a Vulkan surface for it on the other connection.
+        g_x11.XSync(g_x11.window, 0);
+        return reinterpret_cast<NativeWindow>(static_cast<uintptr_t>(child));
+    }
+#else
+    // Main thread: a child window the GS presents into, the size of the parent's client area.
+    HWND makeChild(uint32_t &width, uint32_t &height)
+    {
+        static const wchar_t *const kClass = []
+        {
+            WNDCLASSW wc{};
+            wc.lpfnWndProc = ChildProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.lpszClassName = L"ps2x_pcsx2_gs";
+            RegisterClassW(&wc);
+            return wc.lpszClassName;
+        }();
+        RECT rect{};
+        GetClientRect(g_parent, &rect);
+        width = static_cast<uint32_t>(std::max<LONG>(1, rect.right - rect.left));
+        height = static_cast<uint32_t>(std::max<LONG>(1, rect.bottom - rect.top));
+        HWND child = CreateWindowExW(WS_EX_NOPARENTNOTIFY, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0,
+                                     static_cast<int>(width), static_cast<int>(height), g_parent, nullptr,
+                                     GetModuleHandleW(nullptr), nullptr);
+        if (!child)
+            std::fprintf(stderr, "[gs] PCSX2 GS: child window creation failed (error %lu)\n", GetLastError());
+        return child;
+    }
+#endif
+}
+
+void GSPcsx2Backend::AttachHostWindow(void *parentHwnd)
+{
+    if (!Requested() || !parentHwnd || g_child)
+        return;
+#if defined(_WIN32)
+    g_parent = static_cast<HWND>(parentHwnd);
+    // The game window must not paint over its child (GLFW already sets WS_CLIPCHILDREN; made sure here).
+    SetWindowLongPtrW(g_parent, GWL_STYLE, GetWindowLongPtrW(g_parent, GWL_STYLE) | WS_CLIPCHILDREN);
+#else
+    // The GLFW window (raylib's GetWindowHandle on Linux). Its platform was checked by Requested() only if it already
+    // existed then; checked here again.
+    if (glfwGetPlatform() != kGlfwPlatformX11 || !g_x11.Open())
+    {
+        std::fprintf(stderr, "[gs] PCSX2 GS: the game window is not an X11 window; nothing will be drawn\n");
+        return;
+    }
+    g_parent = parentHwnd;
+    g_setDisplay(g_x11.present);
+#endif
+    uint32_t width = 0u, height = 0u;
+    g_child = makeChild(width, height);
+    if (!g_child)
+        return;
+    g_clientWidth.store(width);
+    g_clientHeight.store(height);
+}
+
+namespace
+{
+    // Main thread: the child window hidden while a host UI or the shader notice is up, shown otherwise.
+    void syncChildHidden()
+    {
+        const bool hidden = g_hostUiVisible || g_noticeShowing;
+        if (!g_child || hidden == g_childHidden)
+            return;
+        g_childHidden = hidden;
+        // A graphics API switch's new window too (HostTick, ApiStep::Window): it becomes the child at the swap.
+        for (NativeWindow window : {g_child, g_newChild})
+        {
+            if (!window)
+                continue;
+#if defined(_WIN32)
+            ShowWindow(window, hidden ? SW_HIDE : SW_SHOWNA);
+#else
+            if (hidden)
+                g_x11.XUnmapWindow(g_x11.window, g_x11.id(window));
+            else
+                g_x11.XMapWindow(g_x11.window, g_x11.id(window));
+#endif
+        }
+#if !defined(_WIN32)
+        g_x11.XSync(g_x11.window, 0);
+#endif
+    }
+
+    // Main thread, each host frame: whether the shader notice shows, with a fresh count every 100 ms while it does.
+    void updateNotice()
+    {
+        bool show = false;
+        if (g_noticeStage.load(std::memory_order_acquire) == 1 && noticeEnabled())
+        {
+            std::lock_guard<std::mutex> lock(g_noticeMutex);
+            const double now = secondsNow();
+            show = g_notice.visible(now);
+            if (show)
+                g_noticeWasShown.store(true, std::memory_order_relaxed); // under the lock noticeEnd reads it after
+            if (show && now - g_noticeLastPoll >= 0.1)
+            {
+                g_noticeLastPoll = now;
+                ps2x::gs::ShaderIndexSample samples[ps2x::gs::kShaderIndexCount];
+                sampleShaderIndexes(g_noticeCacheDir, samples);
+                g_noticeIndexes.observe(samples);
+                g_notice.setCompiled(g_noticeIndexes.compiled());
+            }
+        }
+        if (show == g_noticeShowing)
+            return;
+        g_noticeShowing = show;
+        syncChildHidden();
+    }
+}
+
+void GSPcsx2Backend::HostTick()
+{
+    if (!g_child)
+        return;
+    updateNotice();
+    // A graphics API switch: the new window under the old one (the old one keeps showing the picture until the GS
+    // presents into the new one), then, once the GS has, the old one goes.
+    if (g_apiStep.load(std::memory_order_acquire) == ApiStep::Window)
+    {
+        uint32_t width = 0u, height = 0u;
+        g_newChild = makeChild(width, height);
+        if (g_newChild)
+        {
+#if defined(_WIN32)
+            SetWindowPos(g_newChild, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (g_childHidden)
+                ShowWindow(g_newChild, SW_HIDE);
+#else
+            g_x11.XLowerWindow(g_x11.window, g_x11.id(g_newChild));
+            if (g_childHidden)
+                g_x11.XUnmapWindow(g_x11.window, g_x11.id(g_newChild));
+            g_x11.XSync(g_x11.window, 0);
+#endif
+            g_apiStep.store(ApiStep::Reopen, std::memory_order_release);
+        }
+        else
+        {
+            g_apiResult.store(0, std::memory_order_relaxed);
+            g_apiStep.store(ApiStep::Idle, std::memory_order_release);
+        }
+    }
+    else if (g_apiStep.load(std::memory_order_acquire) == ApiStep::Swap)
+    {
+#if !defined(_WIN32)
+        const auto DestroyWindow = [](NativeWindow window)
+        {
+            g_x11.XDestroyWindow(g_x11.window, g_x11.id(window));
+            g_x11.XSync(g_x11.window, 0);
+        };
+#endif
+        if (g_newChild && g_apiResult.load(std::memory_order_relaxed) == 2)
+            DestroyWindow(g_newChild); // that API already ran: the GS stays in its window
+        else if (g_newChild)
+        {
+            NativeWindow old = g_child;
+            g_child = g_newChild;
+            DestroyWindow(old);
+        }
+        g_newChild = nullptr;
+        g_apiStep.store(ApiStep::Idle, std::memory_order_release);
+    }
+#if !defined(_WIN32)
+    uint32_t width = 0u, height = 0u;
+    parentSize(width, height);
+    if (width == g_clientWidth.load(std::memory_order_relaxed) && height == g_clientHeight.load(std::memory_order_relaxed))
+        return;
+    g_x11.XResizeWindow(g_x11.window, g_x11.id(g_child), width, height);
+    if (g_newChild)
+        g_x11.XResizeWindow(g_x11.window, g_x11.id(g_newChild), width, height);
+    // On the server before the GS thread resizes its swap chain to the new size.
+    g_x11.XSync(g_x11.window, 0);
+    g_clientWidth.store(width, std::memory_order_relaxed);
+    g_clientHeight.store(height, std::memory_order_relaxed);
+#else
+    RECT rect{};
+    GetClientRect(g_parent, &rect);
+    const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, rect.right - rect.left));
+    const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, rect.bottom - rect.top));
+    if (width == g_clientWidth.load(std::memory_order_relaxed) && height == g_clientHeight.load(std::memory_order_relaxed))
+        return;
+    SetWindowPos(g_child, nullptr, 0, 0, static_cast<int>(width), static_cast<int>(height), SWP_NOZORDER | SWP_NOACTIVATE);
+    if (g_newChild)
+        SetWindowPos(g_newChild, nullptr, 0, 0, static_cast<int>(width), static_cast<int>(height), SWP_NOZORDER | SWP_NOACTIVATE);
+    g_clientWidth.store(width, std::memory_order_relaxed);
+    g_clientHeight.store(height, std::memory_order_relaxed);
+#endif
+}
+
+bool GSPcsx2Backend::SetGraphicsApi(const char *api)
+{
+    if (!g_setApi || !g_child || !api || !*api)
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(g_apiMutex);
+        g_apiWanted = api;
+    }
+    // A switch already under way takes the latest choice if it has not reopened yet.
+    ApiStep idle = ApiStep::Idle;
+    g_apiStep.compare_exchange_strong(idle, ApiStep::Window, std::memory_order_acq_rel);
+    return true;
+}
+
+bool GSPcsx2Backend::GraphicsApiBusy()
+{
+    return g_apiStep.load(std::memory_order_acquire) != ApiStep::Idle;
+}
+
+int GSPcsx2Backend::GraphicsApiResult()
+{
+    return g_apiResult.load(std::memory_order_relaxed);
+}
+
+bool GSPcsx2Backend::Active()
+{
+    return g_child != nullptr;
+}
+
+void GSPcsx2Backend::SetOsd(const char *top, uint32_t topRgba, float topAlpha, const char *bottom)
+{
+    if (g_api && g_child)
+        g_api->set_osd(top, topRgba, topAlpha, bottom);
+}
+
+bool GSPcsx2Backend::SetOption(const char *key, const char *value)
+{
+    if (!g_setOption)
+        return false;
+    g_setOption(key, value);
+    return true;
+}
+
+void GSPcsx2Backend::SetScale(float scale)
+{
+    if (scale >= 1.0f)
+        g_pendingScale.store(scale, std::memory_order_relaxed);
+}
+
+bool GSPcsx2Backend::SetOverlay(const float *lines, const uint32_t *colors, uint32_t count)
+{
+    if (!g_setOverlay)
+        return false;
+    g_setOverlay(lines, colors, count);
+    return true;
+}
+
+bool GSPcsx2Backend::SetOverlayText(const float *xy, const uint32_t *colors, const char *texts, uint32_t count)
+{
+    if (!g_setOverlayText)
+        return false;
+    g_setOverlayText(xy, colors, texts, count);
+    return true;
+}
+
+bool GSPcsx2Backend::SetScreen(const void *items, uint32_t count, const char *strings, uint32_t bytes)
+{
+    if (!g_setScreen)
+        return false;
+    g_setScreen(static_cast<const Pcsx2GsScreenItem *>(items), count, strings, bytes);
+    return true;
+}
+
+void GSPcsx2Backend::SetMenu(void *draw, void *user)
+{
+    if (g_api)
+        g_api->set_menu(reinterpret_cast<Pcsx2GsMenuFn>(draw), user);
+}
+
+void GSPcsx2Backend::SetMenuInput(const void *input)
+{
+    if (g_api && input)
+        g_api->menu_input(static_cast<const Pcsx2GsMenuInput *>(input));
+}
+
+uint64_t GSPcsx2Backend::Presents()
+{
+    return g_presents.load(std::memory_order_relaxed);
+}
+
+void GSPcsx2Backend::SetHostUiVisible(bool visible)
+{
+    if (!g_child || g_hostUiVisible == visible)
+        return;
+    g_hostUiVisible = visible;
+    syncChildHidden();
+}
+
+bool GSPcsx2Backend::ShaderNotice(std::string &title, std::string &detail, float &blockStart, float &blockEnd)
+{
+    if (!g_noticeShowing)
+        return false;
+    std::lock_guard<std::mutex> lock(g_noticeMutex);
+    const double now = secondsNow();
+    title = ps2x::gs::ShaderNotice::title();
+    detail = g_notice.detail(now);
+    ps2x::gs::ShaderNotice::block(now, blockStart, blockEnd);
+    return true;
+}
+
+bool GSPcsx2Backend::ShaderNoticeResult(double &ms, int64_t &compiled)
+{
+    if (g_noticeStage.load(std::memory_order_acquire) != 2)
+        return false;
+    std::lock_guard<std::mutex> lock(g_noticeMutex);
+    ms = g_notice.elapsed(0.0) * 1000.0;
+    compiled = g_notice.compiled();
+    return true;
+}
+
+bool GSPcsx2Backend::HostUiVisible()
+{
+    return g_hostUiVisible;
+}
+
+GSPcsx2Backend::GSPcsx2Backend() = default;
+
+GSPcsx2Backend::~GSPcsx2Backend()
+{
+    if (m_open && g_api)
+        g_api->close();
+}
+
+// Opened on the GS thread at its first command, not from Initialize: the main thread (which owns the window and
+// pumps its messages) is then free while DXGI creates the swap chain.
+bool GSPcsx2Backend::EnsureOpen()
+{
+    if (m_open)
+        return true;
+    if (m_failed || !g_api || !g_child)
+        return false;
+    const std::filesystem::path dir = exeDirectory();
+    const std::string resources = utf8(dir / "resources");
+    // The shader cache is written as the game runs: in the play folder (KAMITE_HOME) when there is one, else next to
+    // the executable. The resources are always read from the executable's folder.
+    const std::filesystem::path home = playFolder();
+    // PS2X_PCSX2_SHADER_CACHE_DIR: another folder (tests: an empty one shows what a first-ever run is like).
+    const char *cacheOverride = std::getenv("PS2X_PCSX2_SHADER_CACHE_DIR");
+    const std::filesystem::path cacheDir = cacheOverride && *cacheOverride ? std::filesystem::path(cacheOverride)
+                                                                           : (home.empty() ? dir : home) / "shadercache_pcsx2";
+    std::error_code ec;
+    std::filesystem::create_directories(cacheDir, ec);
+    const std::string cache = utf8(cacheDir);
+    m_width = g_clientWidth.load();
+    m_height = g_clientHeight.load();
+    Pcsx2GsOpenParams params{};
+    params.hwnd = g_child;
+    params.width = m_width;
+    params.height = m_height;
+    params.scale = static_cast<float>(std::clamp(envInt("PS2X_GS_SCALE", 1), 1, 8));
+    params.resources = resources.c_str();
+    params.cache = cache.c_str();
+    params.vsync = static_cast<uint32_t>(std::clamp(envInt("PS2X_PCSX2_VSYNC", 2), 0, 2)); // mailbox: no tearing, no wait
+    params.stretch = envInt("PS2X_PCSX2_STRETCH", 0) != 0 ? 1u : 0u;
+    // Image options (pcsx2gs_api.h): PS2X_PCSX2_<KEY> -> key=value. FXAA is on unless PS2X_PCSX2_FXAA=0.
+    static constexpr struct
+    {
+        const char *variable;
+        const char *key;
+        const char *fallback;
+    } kOptions[] = {
+        {"PS2X_PCSX2_API", "api", nullptr},                           // vulkan (default) / dx11
+        {"PS2X_PCSX2_DXGI_PRESENT", "dxgi_present", nullptr},         // 0: Vulkan presents its own way (not through DXGI)
+        {"PS2X_PCSX2_FXAA", "fxaa", "1"},
+        {"PS2X_PCSX2_TEXTURE_FILTERING", "texture_filtering", nullptr},
+        {"PS2X_PCSX2_CRUNCHY", "crunchy", nullptr},                   // Texture Filtering: 0 the PS2's, 1 3D, 2 3D + UI unfiltered
+        {"PS2X_PCSX2_TRILINEAR", "trilinear", nullptr},
+        {"PS2X_PCSX2_ANISOTROPY", "anisotropy", "16"},             // GRAPHICS > Anisotropic Filtering (16x default)
+        {"PS2X_PCSX2_CAS", "cas", nullptr},
+        {"PS2X_PCSX2_CAS_SHARPNESS", "cas_sharpness", nullptr},
+        {"PS2X_PCSX2_SHADEBOOST", "shadeboost", nullptr},
+        {"PS2X_PCSX2_BRIGHTNESS", "brightness", nullptr},
+        {"PS2X_PCSX2_CONTRAST", "contrast", nullptr},
+        {"PS2X_PCSX2_SATURATION", "saturation", nullptr},
+        {"PS2X_PCSX2_GAMMA", "gamma", nullptr},
+        {"PS2X_PCSX2_BRIGHTNESS_PERCENT", "brightness_percent", nullptr}, // Brightness: 100 = unchanged
+        {"PS2X_PCSX2_TV_SHADER", "tv_shader", nullptr},
+        {"PS2X_PCSX2_PRESENT_FILTER", "present_filter", nullptr},
+        {"PS2X_PCSX2_DITHERING", "dithering", nullptr},
+        {"PS2X_PCSX2_BLENDING", "blending", nullptr},
+        {"PS2X_PCSX2_TEXTURE_PRECACHE", "texture_precache", nullptr},
+        {"PS2X_PCSX2_ASPECT", "aspect", nullptr},
+        {"PS2X_PCSX2_NATIVE_SCALING", "native_scaling", "upscaled"},  // post effects: upscaled (default, Nov 13) / ps2 (PCSX2's fix) / off
+        {"PS2X_PCSX2_HALF_PIXEL_OFFSET", "half_pixel_offset", nullptr}, // dev: 0..5, the game's fix is 2
+        // Performance experiments (Oct 26, the casino): the GS thread's cost per draw and per texture upload.
+        {"PS2X_PCSX2_GPU_PALETTE", "gpu_palette", nullptr},                   // 1: 4/8-bit textures converted on the GPU
+        {"PS2X_PCSX2_TEXTURE_PRELOADING", "texture_preloading", nullptr},     // 0 none, 1 partial, 2 full (the default)
+        {"PS2X_PCSX2_PARTIAL_INVALIDATION", "partial_invalidation", nullptr}, // 0: PCSX2's "disable partial invalidation" hack
+    };
+    std::string options;
+    for (const auto &option : kOptions)
+    {
+        const char *value = std::getenv(option.variable);
+        if (!value || !*value)
+            value = option.fallback;
+        if (value)
+            options += std::string(option.key) + "=" + value + ";";
+    }
+    // HD textures (PS2X_PCSX2_TEXTURES=0 turns them off): a PCSX2 replacement pack from PS2X_PCSX2_TEXTURE_DIR (the
+    // folder holding replacements/). The game layer (kamite hd_textures.cpp) finds its packs itself (mods, the Texture
+    // Pack Folder) and hands them over as PS2X_PCSX2_TEXTURE_FIRST, so it can switch them while running.
+    if (envInt("PS2X_PCSX2_TEXTURES", 1) != 0)
+    {
+        const char *textureDir = std::getenv("PS2X_PCSX2_TEXTURE_DIR");
+        if (textureDir && *textureDir)
+        {
+            const std::filesystem::path folder(reinterpret_cast<const char8_t *>(textureDir));
+            if (std::filesystem::is_directory(folder / "replacements", ec))
+                options += "texture_dir=" + utf8(folder) + ";";
+            else
+                std::fprintf(stderr, "[gs] PS2X_PCSX2_TEXTURE_DIR: no replacements folder in %s\n", utf8(folder).c_str());
+        }
+    }
+    // PS2X_PCSX2_TEXTURE_EXTRA: more replacement folders ('|' between), e.g. a character mod's own textures (kamite
+    // sets it for [Mods] Character); used with or without a texture pack.
+    if (const char *extra = std::getenv("PS2X_PCSX2_TEXTURE_EXTRA"); extra && *extra)
+        options += std::string("texture_extra=") + extra + ";";
+    // PS2X_PCSX2_TEXTURE_FIRST: folders searched before the texture pack ('|' between, the winner first): the texture
+    // folders of the enabled mods, then the Texture Pack Folder (kamite hd_textures.cpp); switched live with the
+    // "texture_first" option (SetOption).
+    if (const char *first = std::getenv("PS2X_PCSX2_TEXTURE_FIRST"); first && *first)
+        options += std::string("texture_first=") + first + ";";
+    params.options = options.c_str();
+    noticeBegin(cacheDir);
+    m_open = g_api->open(&params) != 0;
+    m_failed = !m_open;
+    if (m_failed)
+        noticeEnd();
+    if (m_open && !m_pendingVram.empty())
+    {
+        g_api->load_vram(m_pendingVram.data(), static_cast<uint32_t>(m_pendingVram.size()));
+        m_pendingVram.clear();
+    }
+    if (m_failed)
+        std::fprintf(stderr, "[gs] PCSX2 GS failed to open; nothing will be drawn\n");
+    return m_open;
+}
+
+// GS::init and save-state loads: the GS local memory as the state has it. Kept until the GS is open.
+void GSPcsx2Backend::Initialize(uint8_t *vram, uint32_t vramSize)
+{
+    if (!vram || vramSize == 0u)
+        return;
+    m_pendingVram.assign(vram, vram + vramSize);
+    m_vramSize = vramSize;
+    m_downloadLeft = 0u;
+    if (m_open)
+    {
+        g_api->load_vram(m_pendingVram.data(), static_cast<uint32_t>(m_pendingVram.size()));
+        m_pendingVram.clear();
+    }
+}
+
+void GSPcsx2Backend::Reset()
+{
+    m_downloadLeft = 0u;
+    if (m_open)
+        g_api->reset();
+}
+
+void GSPcsx2Backend::GsReset()
+{
+    Reset();
+}
+
+void GSPcsx2Backend::BeginTransfer(const GSTransferCommand &command)
+{
+    if (command.direction != 1u)
+    {
+        m_downloadLeft = 0u;
+        return;
+    }
+    m_download = command;
+    const uint64_t bits = static_cast<uint64_t>(command.trxreg.rrw) * command.trxreg.rrh * transferBits(command.bitbltbuf.spsm);
+    m_downloadLeft = static_cast<uint32_t>(std::min<uint64_t>((bits + 7u) / 8u, 4u * 1024u * 1024u));
+}
+
+uint32_t GSPcsx2Backend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+{
+    const uint32_t count = std::min(maxBytes, m_downloadLeft);
+    if (count == 0u || !EnsureOpen())
+        return 0u;
+    const uint32_t qwc = (count + 15u) / 16u;
+    if (dst && qwc * 16u <= maxBytes)
+        g_api->read_fifo(dst, qwc);
+    else
+    {
+        static thread_local std::vector<uint8_t> scratch;
+        scratch.assign(static_cast<size_t>(qwc) * 16u, 0u);
+        g_api->read_fifo(scratch.data(), qwc);
+        if (dst)
+            std::memcpy(dst, scratch.data(), count);
+    }
+    m_downloadLeft -= count;
+    return count;
+}
+
+// Save states: the GS local memory with the render targets written back (the GS is opened lazily, so before its
+// first command the memory is still the one Initialize got).
+void GSPcsx2Backend::SnapshotVram(std::vector<uint8_t> &out) const
+{
+    if (!m_open)
+    {
+        out = m_pendingVram;
+        return;
+    }
+    out.assign(m_vramSize, 0u);
+    out.resize(g_api->save_vram(out.data(), static_cast<uint32_t>(out.size())));
+}
+
+bool GSPcsx2Backend::ReadTransfer(const GSTransferCommand &command, std::vector<uint8_t> &out)
+{
+    if (!EnsureOpen())
+        return false;
+    const GSBitBltBuf &b = command.bitbltbuf;
+    const GSTrxPos &p = command.trxpos;
+    const uint64_t bitbltbuf = static_cast<uint64_t>(b.sbp & 0x3FFFu) | (static_cast<uint64_t>(b.sbw & 0x3Fu) << 16) |
+                               (static_cast<uint64_t>(b.spsm & 0x3Fu) << 24) | (static_cast<uint64_t>(b.dbp & 0x3FFFu) << 32) |
+                               (static_cast<uint64_t>(b.dbw & 0x3Fu) << 48) | (static_cast<uint64_t>(b.dpsm & 0x3Fu) << 56);
+    const uint64_t trxpos = static_cast<uint64_t>(p.ssax & 0x7FFu) | (static_cast<uint64_t>(p.ssay & 0x7FFu) << 16) |
+                            (static_cast<uint64_t>(p.dsax & 0x7FFu) << 32) | (static_cast<uint64_t>(p.dsay & 0x7FFu) << 48) |
+                            (static_cast<uint64_t>(p.dir & 3u) << 59);
+    const uint64_t trxreg = static_cast<uint64_t>(command.trxreg.rrw & 0xFFFu) | (static_cast<uint64_t>(command.trxreg.rrh & 0xFFFu) << 32);
+    const uint64_t bits = static_cast<uint64_t>(command.trxreg.rrw) * command.trxreg.rrh * transferBits(b.spsm);
+    out.assign(static_cast<size_t>((bits + 7u) / 8u), 0u);
+    if (out.empty())
+        return true;
+    out.resize(g_api->read_local(out.data(), static_cast<uint32_t>(out.size()), bitbltbuf, trxpos, trxreg));
+    return true;
+}
+
+GSTransferSnapshot GSPcsx2Backend::GetTransferSnapshot() const
+{
+    GSTransferSnapshot snapshot;
+    snapshot.direction = m_downloadLeft ? 1u : 3u;
+    snapshot.localToHostPendingBytes = m_downloadLeft;
+    return snapshot;
+}
+
+void GSPcsx2Backend::RawGif(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (sizeBytes >= 16u && EnsureOpen())
+    {
+        g_api->gif(data, sizeBytes / 16u);
+        m_gifBytes += sizeBytes;
+        if (gifDump().active)
+            gifDumpRecord('G', data, sizeBytes & ~15u);
+    }
+}
+
+int64_t GSPcsx2Backend::PresentPoll()
+{
+    return (g_presentPoll && m_open) ? g_presentPoll() : -1;
+}
+
+void GSPcsx2Backend::VSync(const GSVSyncRegs &regs)
+{
+    if (!EnsureOpen())
+        return;
+    const uint32_t width = g_clientWidth.load(std::memory_order_relaxed);
+    const uint32_t height = g_clientHeight.load(std::memory_order_relaxed);
+    if (width != m_width || height != m_height)
+    {
+        m_width = width;
+        m_height = height;
+        g_api->resize(width, height);
+    }
+    // The OPTIONS screen's Internal Resolution (the DLL's GSUpdateConfig runs here, on the GS thread).
+    if (const float scale = g_pendingScale.exchange(0.0f, std::memory_order_relaxed); scale >= 1.0f)
+        g_api->set_scale(scale);
+    // Its Graphics API: the DLL's device and renderer made again in the new window (SetGraphicsApi).
+    if (g_apiStep.load(std::memory_order_acquire) == ApiStep::Reopen)
+    {
+        std::string api;
+        {
+            std::lock_guard<std::mutex> lock(g_apiMutex);
+            api = g_apiWanted;
+        }
+        const int result = g_setApi(api.c_str(), g_newChild, width, height);
+        g_apiResult.store(result, std::memory_order_relaxed);
+        std::fprintf(stderr, "[gs] graphics API %s: %s\n", api.c_str(),
+                     result == 2   ? "already running"
+                     : result > 0  ? "switched"
+                     : result == 0 ? "could not start; the previous one runs"
+                                   : "failed; nothing is drawn");
+        if (result < 0)
+        {
+            m_open = false;
+            m_failed = true;
+            noticeEnd(); // nothing will ever be presented: the notice must not stay up
+        }
+        g_apiStep.store(ApiStep::Swap, std::memory_order_release);
+        if (result < 0)
+            return;
+    }
+    // Before the present, not after: the child window is hidden while the notice shows, and a driver that blocks a
+    // present into an unmapped window would then never let the notice end. The first frame's draws (and the shader
+    // compiles they bring) have already run in RawGif.
+    if (g_noticeStage.load(std::memory_order_relaxed) == 1)
+        noticeEnd();
+    const auto presentStart = std::chrono::steady_clock::now();
+    g_api->vsync(reinterpret_cast<const Pcsx2GsPrivRegs *>(&regs));
+    WriteFrameTime(presentStart);
+    g_presents.fetch_add(1u, std::memory_order_relaxed);
+    if (GifDump &dump = gifDump(); !dump.done)
+    {
+        if (dump.active)
+        {
+            const uint64_t field = m_fields;
+            gifDumpRecord('V', &regs, sizeof(regs), &field, sizeof(field));
+            if (dump.fields-- <= 1u)
+            {
+                dump.active = false;
+                dump.done = true;
+                std::fclose(dump.file);
+                std::fprintf(stderr, "[gs] PS2X_GIF_DUMP written\n");
+            }
+        }
+        else if (std::chrono::duration<double>(presentStart - g_processStart).count() >= dump.startSeconds)
+        {
+            std::vector<uint8_t> vram;
+            SnapshotVram(vram);
+            gifDumpRecord('M', vram.data(), static_cast<uint32_t>(vram.size()));
+            dump.active = true;
+        }
+    }
+    // PS2X_PCSX2_SNAPSHOT_DIR=<folder>: the GS image every PS2X_PCSX2_SNAPSHOT_EVERY fields (300) as field-<n>.bmp.
+    static const char *snapshotDir = std::getenv("PS2X_PCSX2_SNAPSHOT_DIR");
+    static const int snapshotEvery = std::max(1, envInt("PS2X_PCSX2_SNAPSHOT_EVERY", 300));
+    // STAR 2026-11-23: PS2X_PCSX2_SNAPSHOT_FROM / _TO limit the snapshots to a range of fields (a burst of every field).
+    static const int snapshotFrom = envInt("PS2X_PCSX2_SNAPSHOT_FROM", 0);
+    static const int snapshotTo = envInt("PS2X_PCSX2_SNAPSHOT_TO", 0x7FFFFFFF);
+    ++m_fields;
+    if (m_fields == 60u || m_fields % 3600u == 0u)
+        std::fprintf(stderr, "[gs] PCSX2 GS: %llu fields, %.1f MB of GIF data\n", static_cast<unsigned long long>(m_fields),
+                     static_cast<double>(m_gifBytes) / (1024.0 * 1024.0));
+    if (snapshotDir && *snapshotDir && m_fields % static_cast<uint64_t>(snapshotEvery) == 0u &&
+        m_fields >= static_cast<uint64_t>(std::max(0, snapshotFrom)) && m_fields <= static_cast<uint64_t>(std::max(0, snapshotTo)))
+    {
+        const std::string path = (std::filesystem::path(snapshotDir) / ("field-" + std::to_string(m_fields) + ".bmp")).string();
+        g_api->snapshot(path.c_str());
+    }
+}
+
+void ps2x::gs::setAspect(Aspect aspect)
+{
+    if (g_setAspect)
+        g_setAspect(aspect == Aspect::Force4_3 ? 3u : aspect == Aspect::Stretch ? 2u : aspect == Aspect::R16_9 ? 1u : 0u);
+}
+
+#else // no pcsx2gs_api.h: the built-in GS only
+
+void ps2x::gs::setAspect(Aspect) {}
+// F10 (ps2_runtime.cpp): the GIF dump is the PCSX2 renderer's; the built-in GS has none.
+void ps2xRequestGifDump(uint32_t, const char *) {}
+
+bool GSPcsx2Backend::Requested() { return false; }
+void GSPcsx2Backend::BeforeHostWindow() {}
+void GSPcsx2Backend::AttachHostWindow(void *) {}
+void GSPcsx2Backend::HostTick() {}
+bool GSPcsx2Backend::Active() { return false; }
+void GSPcsx2Backend::SetOsd(const char *, uint32_t, float, const char *) {}
+void GSPcsx2Backend::SetMenu(void *, void *) {}
+bool GSPcsx2Backend::SetOption(const char *, const char *) { return false; }
+void GSPcsx2Backend::SetScale(float) {}
+bool GSPcsx2Backend::SetGraphicsApi(const char *) { return false; }
+bool GSPcsx2Backend::GraphicsApiBusy() { return false; }
+int GSPcsx2Backend::GraphicsApiResult() { return 1; }
+bool GSPcsx2Backend::SetOverlay(const float *, const uint32_t *, uint32_t) { return false; }
+bool GSPcsx2Backend::SetOverlayText(const float *, const uint32_t *, const char *, uint32_t) { return false; }
+bool GSPcsx2Backend::SetScreen(const void *, uint32_t, const char *, uint32_t) { return false; }
+void GSPcsx2Backend::SetMenuInput(const void *) {}
+void GSPcsx2Backend::SetHostUiVisible(bool) {}
+bool GSPcsx2Backend::HostUiVisible() { return false; }
+bool GSPcsx2Backend::ShaderNotice(std::string &, std::string &, float &, float &) { return false; }
+bool GSPcsx2Backend::ShaderNoticeResult(double &, int64_t &) { return false; }
+uint64_t GSPcsx2Backend::Presents() { return 0u; }
+GSPcsx2Backend::GSPcsx2Backend() = default;
+GSPcsx2Backend::~GSPcsx2Backend() = default;
+bool GSPcsx2Backend::EnsureOpen() { return false; }
+void GSPcsx2Backend::Initialize(uint8_t *, uint32_t) {}
+void GSPcsx2Backend::Reset() {}
+void GSPcsx2Backend::GsReset() {}
+void GSPcsx2Backend::BeginTransfer(const GSTransferCommand &) {}
+uint32_t GSPcsx2Backend::ConsumeLocalToHostBytes(uint8_t *, uint32_t) { return 0u; }
+void GSPcsx2Backend::SnapshotVram(std::vector<uint8_t> &out) const { out.clear(); }
+bool GSPcsx2Backend::ReadTransfer(const GSTransferCommand &, std::vector<uint8_t> &) { return false; }
+GSTransferSnapshot GSPcsx2Backend::GetTransferSnapshot() const { return {}; }
+void GSPcsx2Backend::RawGif(const uint8_t *, uint32_t) {}
+void GSPcsx2Backend::VSync(const GSVSyncRegs &) {}
+int64_t GSPcsx2Backend::PresentPoll() { return -1; }
+void GSPcsx2Backend::WriteFrameTime(std::chrono::steady_clock::time_point) {}
+
+#endif

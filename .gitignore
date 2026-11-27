@@ -1,0 +1,25 @@
+# Game data: never stored here (everyone uses their own disc)
+game/
+reference/
+*.iso
+*.elf
+SLPS_*
+SLUS_*
+
+# Generated from the game's code: rebuilt from the disc
+generated/
+recomp/output/
+
+# Big or rebuildable tools and projects
+tools/downloads/
+tools/ghidra_*_PUBLIC/
+ghidra/
+upstream/
+build/
+
+# Python / editor clutter
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+previews/

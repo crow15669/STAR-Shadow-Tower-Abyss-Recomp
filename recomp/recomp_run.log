@@ -1,0 +1,278 @@
+[recompiler] parsing config
+[recompiler] parsing ELF
+[recompiler] extracted 19526 functions, 0 symbols, 8 sections, 0 relocations
+[recompiler] recompiling 19526 functions
+[recompiler] collected 21793 resumable entry point(s) across 2209 owner function(s)
+[recompiler] recompilation pass completed
+[recompiler] generated function header file: "../generated\\ps2_recompiled_functions.h"
+[recompiler] generating function output with 8 worker(s)
+[recompiler] wrote individual function files to ../generated
+[recompiler] generated function registration file: "../generated\\register_functions.cpp"
+[recompiler] generated stub header file: "../generated\\ps2_recompiled_stubs.h"
+
+========== PS2Recomp report ==========
+Functions discovered: 19526
+Symbols: 0, sections: 8, relocations: 0
+Functions processed: 19526, recompiled: 19413, stubs: 113, skipped: 0, decode failures: 0
+Additional entrypoints: 21793
+Generated functions: 19526
+Indirect fallback promotions: 248 (17029 fallback entries)
+Unhandled instructions: 0
+Correctness-critical guest fallbacks: 0, failures: 0
+Warnings: 248, errors: 0
+
+Events:
+  [info] config - Parsing toml file: sta.toml
+  [info] ghidra-map - Loaded 19526 functions from Ghidra map
+  [info] elf - ELF entry point: 0x100008
+  [info] elf - No BSS found, gp=0x0
+  [warning] control-flow function=_doMC addr=0x104320 - unresolved JR/JALR at 0x104320 0x104334; promoted 1012 fallback entries
+  [warning] control-flow function=FUN_00106d38 addr=0x106e00 - unresolved JR/JALR at 0x106e00; promoted 74 fallback entries
+  [warning] control-flow function=FUN_00108dd8 addr=0x108f24 - unresolved JR/JALR at 0x108f24 0x108ff4; promoted 190 fallback entries
+  [warning] control-flow function=FUN_00109e40 addr=0x109e74 - unresolved JR/JALR at 0x109e74; promoted 20 fallback entries
+  [warning] control-flow function=FUN_0010d330 addr=0x10d374 - unresolved JR/JALR at 0x10d374; promoted 90 fallback entries
+  [warning] control-flow function=FUN_0010d498 addr=0x10d524 - unresolved JR/JALR at 0x10d524 0x10d664 0x10d724 0x10d798 0x10d814 0x10d8e4 0x10d924 0x10d96c 0x10d978 0x10d984 0x10d990 0x10d99c 0x10d9a8 0x10d9d4 0x10da08 0x10da20; promoted 379 fallback entries
+  [warning] control-flow function=FUN_0010e090 addr=0x10e158 - unresolved JR/JALR at 0x10e158 0x10e194; promoted 74 fallback entries
+  [warning] control-flow function=FUN_0010e568 addr=0x10e5c0 - unresolved JR/JALR at 0x10e5c0; promoted 45 fallback entries
+  [warning] control-flow function=FUN_0010f808 addr=0x10f818 - unresolved JR/JALR at 0x10f818; promoted 11 fallback entries
+  [warning] control-flow function=FUN_001166f0 addr=0x11679c - unresolved JR/JALR at 0x11679c; promoted 47 fallback entries
+  [warning] control-flow function=FUN_00116ad0 addr=0x116af8 - unresolved JR/JALR at 0x116af8; promoted 15 fallback entries
+  [warning] control-flow function=FUN_00121c28 addr=0x121c7c - unresolved JR/JALR at 0x121c7c 0x121ca8; promoted 43 fallback entries
+  [warning] control-flow function=FUN_00121cd8 addr=0x121db4 - unresolved JR/JALR at 0x121db4; promoted 69 fallback entries
+  [warning] control-flow function=FUN_00122558 addr=0x122610 - unresolved JR/JALR at 0x122610 0x122730 0x12287c; promoted 248 fallback entries
+  [warning] control-flow function=FUN_00122938 addr=0x122984 - unresolved JR/JALR at 0x122984; promoted 37 fallback entries
+  [warning] control-flow function=caseD_7 addr=0x135138 - unresolved JR/JALR at 0x135138; promoted 10 fallback entries
+  [warning] control-flow function=FUN_0013ab00 addr=0x13ab64 - unresolved JR/JALR at 0x13ab64; promoted 120 fallback entries
+  [warning] control-flow function=FUN_0013b220 addr=0x13b31c - unresolved JR/JALR at 0x13b31c 0x13b35c 0x13b3d4 0x13b40c 0x13b45c; promoted 179 fallback entries
+  [warning] control-flow function=FUN_0014d8e0 addr=0x14d91c - unresolved JR/JALR at 0x14d91c; promoted 21 fallback entries
+  [warning] control-flow function=FUN_0014d940 addr=0x14d97c - unresolved JR/JALR at 0x14d97c; promoted 21 fallback entries
+  [warning] control-flow function=FUN_0014d9a0 addr=0x14d9dc - unresolved JR/JALR at 0x14d9dc; promoted 21 fallback entries
+  [warning] control-flow function=FUN_00166170 addr=0x166890 - unresolved JR/JALR at 0x166890 0x1668bc 0x1668ec 0x166914; promoted 512 fallback entries
+  [warning] control-flow function=FUN_001717a0 addr=0x171914 - unresolved JR/JALR at 0x171914; promoted 120 fallback entries
+  [warning] control-flow function=FUN_0017f5c0 addr=0x17f5fc - unresolved JR/JALR at 0x17f5fc; promoted 35 fallback entries
+  [warning] control-flow function=FUN_0017f650 addr=0x17f6d8 - unresolved JR/JALR at 0x17f6d8 0x17f724 0x17f740; promoted 89 fallback entries
+  [warning] control-flow function=FUN_001829b0 addr=0x182bc0 - unresolved JR/JALR at 0x182bc0; promoted 152 fallback entries
+  [warning] control-flow function=FUN_00189f40 addr=0x18a008 - unresolved JR/JALR at 0x18a008 0x18a068 0x18a0c8; promoted 175 fallback entries
+  [warning] control-flow function=FUN_0018a200 addr=0x18a2b4 - unresolved JR/JALR at 0x18a2b4 0x18a2d8; promoted 68 fallback entries
+  [warning] control-flow function=FUN_0018b180 addr=0x18b2b0 - unresolved JR/JALR at 0x18b2b0; promoted 87 fallback entries
+  [warning] control-flow function=FUN_0018b2e0 addr=0x18b308 - unresolved JR/JALR at 0x18b308; promoted 15 fallback entries
+  [warning] control-flow function=caseD_7 addr=0x19c370 - unresolved JR/JALR at 0x19c370; promoted 16 fallback entries
+  [warning] control-flow function=FUN_0019c6d0 addr=0x19c6ec - unresolved JR/JALR at 0x19c6ec; promoted 181 fallback entries
+  [warning] control-flow function=FUN_001a7420 addr=0x1a76bc - unresolved JR/JALR at 0x1a76bc; promoted 251 fallback entries
+  [warning] control-flow function=FUN_001ac820 addr=0x1ac908 - unresolved JR/JALR at 0x1ac908; promoted 347 fallback entries
+  [warning] control-flow function=FUN_001b37f0 addr=0x1b3a34 - unresolved JR/JALR at 0x1b3a34; promoted 463 fallback entries
+  [warning] control-flow function=FUN_001b8a60 addr=0x1b8c30 - unresolved JR/JALR at 0x1b8c30; promoted 308 fallback entries
+  [warning] control-flow function=FUN_001d8ab0 addr=0x1d8af8 - unresolved JR/JALR at 0x1d8af8; promoted 73 fallback entries
+  [warning] control-flow function=FUN_001da340 addr=0x1da3c4 - unresolved JR/JALR at 0x1da3c4 0x1da404 0x1da44c 0x1da48c; promoted 108 fallback entries
+  [warning] control-flow function=FUN_001dfcb0 addr=0x1dfdc0 - unresolved JR/JALR at 0x1dfdc0 0x1dfeb8; promoted 138 fallback entries
+  [warning] control-flow function=FUN_001dfee0 addr=0x1dff80 - unresolved JR/JALR at 0x1dff80 0x1dfff8; promoted 78 fallback entries
+  [warning] control-flow function=FUN_001e02c0 addr=0x1e0330 - unresolved JR/JALR at 0x1e0330; promoted 61 fallback entries
+  [warning] control-flow function=FUN_001e03c0 addr=0x1e0418 - unresolved JR/JALR at 0x1e0418 0x1e046c; promoted 103 fallback entries
+  [warning] control-flow function=FUN_001e0680 addr=0x1e07ec - unresolved JR/JALR at 0x1e07ec 0x1e0888 0x1e08c4 0x1e08f8 0x1e096c 0x1e09b0 0x1e0a4c; promoted 265 fallback entries
+  [warning] control-flow function=FUN_001e0ab0 addr=0x1e0b28 - unresolved JR/JALR at 0x1e0b28 0x1e0ba8; promoted 86 fallback entries
+  [warning] control-flow function=FUN_001e3ca0 addr=0x1e3d28 - unresolved JR/JALR at 0x1e3d28 0x1e3d40; promoted 70 fallback entries
+  [warning] control-flow function=FUN_001e4bb8 addr=0x1e4bec - unresolved JR/JALR at 0x1e4bec; promoted 53 fallback entries
+  [warning] control-flow function=FUN_001e4d18 addr=0x1e4d44 - unresolved JR/JALR at 0x1e4d44; promoted 129 fallback entries
+  [warning] control-flow function=FUN_001ecab0 addr=0x1ecb28 - unresolved JR/JALR at 0x1ecb28; promoted 367 fallback entries
+  [warning] control-flow function=FUN_001eec98 addr=0x1eecec - unresolved JR/JALR at 0x1eecec 0x1eed04 0x1eed14 0x1eed24 0x1eed34 0x1eed44 0x1eed54; promoted 52 fallback entries
+  [warning] control-flow function=FUN_001eed68 addr=0x1eedd0 - unresolved JR/JALR at 0x1eedd0 0x1eede4 0x1eee18 0x1eee28 0x1eee34 0x1eee54 0x1eee64 0x1eeea0 0x1eef00 0x1eef10; promoted 121 fallback entries
+  [warning] control-flow function=entry_001042f0 addr=0x104320 - unresolved JR/JALR at 0x104320 0x104334; promoted 27 fallback entries
+  [warning] control-flow function=_doMC addr=0x104320 - unresolved JR/JALR at 0x104320 0x104334; promoted 1012 fallback entries
+  [warning] control-flow function=FUN_00106d38 addr=0x106e00 - unresolved JR/JALR at 0x106e00; promoted 74 fallback entries
+  [warning] control-flow function=entry_00106dd8 addr=0x106e00 - unresolved JR/JALR at 0x106e00; promoted 16 fallback entries
+  [warning] control-flow function=FUN_00108dd8 addr=0x108f24 - unresolved JR/JALR at 0x108f24 0x108ff4; promoted 190 fallback entries
+  [warning] control-flow function=entry_00108ee0 addr=0x108f24 - unresolved JR/JALR at 0x108f24; promoted 22 fallback entries
+  [warning] control-flow function=entry_00108fa0 addr=0x108ff4 - unresolved JR/JALR at 0x108ff4; promoted 24 fallback entries
+  [warning] control-flow function=FUN_00109e40 addr=0x109e74 - unresolved JR/JALR at 0x109e74; promoted 20 fallback entries
+  [warning] control-flow function=entry_0010a0a8 addr=0x10a0c0 - unresolved JR/JALR at 0x10a0c0; promoted 8 fallback entries
+  [warning] control-flow function=FUN_0010d330 addr=0x10d374 - unresolved JR/JALR at 0x10d374; promoted 90 fallback entries
+  [warning] control-flow function=entry_0010d4f8 addr=0x10d524 - unresolved JR/JALR at 0x10d524; promoted 13 fallback entries
+  [warning] control-flow function=FUN_0010d498 addr=0x10d524 - unresolved JR/JALR at 0x10d524 0x10d664 0x10d724 0x10d798 0x10d814 0x10d8e4 0x10d924 0x10d96c 0x10d978 0x10d984 0x10d990 0x10d99c 0x10d9a8 0x10d9d4 0x10da08 0x10da20; promoted 379 fallback entries
+  [warning] control-flow function=entry_0010d658 addr=0x10d664 - unresolved JR/JALR at 0x10d664; promoted 10 fallback entries
+  [warning] control-flow function=entry_0010d718 addr=0x10d724 - unresolved JR/JALR at 0x10d724; promoted 10 fallback entries
+  [warning] control-flow function=entry_0010d788 addr=0x10d798 - unresolved JR/JALR at 0x10d798; promoted 6 fallback entries
+  [warning] control-flow function=entry_0010d808 addr=0x10d814 - unresolved JR/JALR at 0x10d814; promoted 10 fallback entries
+  [warning] control-flow function=entry_0010d8d8 addr=0x10d8e4 - unresolved JR/JALR at 0x10d8e4; promoted 10 fallback entries
+  [warning] control-flow function=entry_0010d900 addr=0x10d924 - unresolved JR/JALR at 0x10d924; promoted 13 fallback entries
+  [warning] control-flow function=entry_0010d9c8 addr=0x10d9d4 - unresolved JR/JALR at 0x10d9d4; promoted 10 fallback entries
+  [warning] control-flow function=entry_0010d94c addr=0x10d96c - unresolved JR/JALR at 0x10d96c 0x10d978 0x10d984 0x10d990 0x10d99c 0x10d9a8; promoted 27 fallback entries
+  [warning] control-flow function=entry_0010d9f0 addr=0x10da08 - unresolved JR/JALR at 0x10da08; promoted 10 fallback entries
+  [warning] control-flow function=entry_0010da18 addr=0x10da20 - unresolved JR/JALR at 0x10da20; promoted 6 fallback entries
+  [warning] control-flow function=FUN_0010e090 addr=0x10e158 - unresolved JR/JALR at 0x10e158 0x10e194; promoted 74 fallback entries
+  [warning] control-flow function=entry_0010e10c addr=0x10e158 - unresolved JR/JALR at 0x10e158; promoted 23 fallback entries
+  [warning] control-flow function=entry_0010e168 addr=0x10e194 - unresolved JR/JALR at 0x10e194; promoted 13 fallback entries
+  [warning] control-flow function=FUN_0010e568 addr=0x10e5c0 - unresolved JR/JALR at 0x10e5c0; promoted 45 fallback entries
+  [warning] control-flow function=entry_0010e5b0 addr=0x10e5c0 - unresolved JR/JALR at 0x10e5c0; promoted 8 fallback entries
+  [warning] control-flow function=entry_0010f3ac addr=0x10f3d0 - unresolved JR/JALR at 0x10f3d0; promoted 11 fallback entries
+  [warning] control-flow function=FUN_0010f808 addr=0x10f818 - unresolved JR/JALR at 0x10f818; promoted 11 fallback entries
+  [warning] control-flow function=entry_00114300 addr=0x11440c - unresolved JR/JALR at 0x11440c; promoted 80 fallback entries
+  [warning] control-flow function=entry_00114440 addr=0x114650 - unresolved JR/JALR at 0x114650; promoted 136 fallback entries
+  [warning] control-flow function=FUN_001166f0 addr=0x11679c - unresolved JR/JALR at 0x11679c; promoted 47 fallback entries
+  [warning] control-flow function=entry_00116784 addr=0x11679c - unresolved JR/JALR at 0x11679c; promoted 8 fallback entries
+  [warning] control-flow function=FUN_00116ad0 addr=0x116af8 - unresolved JR/JALR at 0x116af8; promoted 15 fallback entries
+  [warning] control-flow function=entry_00120d98 addr=0x120dcc - unresolved JR/JALR at 0x120dcc; promoted 16 fallback entries
+  [warning] control-flow function=entry_00121c78 addr=0x121c7c - unresolved JR/JALR at 0x121c7c; promoted 5 fallback entries
+  [warning] control-flow function=FUN_00121c28 addr=0x121c7c - unresolved JR/JALR at 0x121c7c 0x121ca8; promoted 43 fallback entries
+  [warning] control-flow function=entry_00121c98 addr=0x121ca8 - unresolved JR/JALR at 0x121ca8; promoted 7 fallback entries
+  [warning] control-flow function=FUN_00121cd8 addr=0x121db4 - unresolved JR/JALR at 0x121db4; promoted 69 fallback entries
+  [warning] control-flow function=entry_00121da8 addr=0x121db4 - unresolved JR/JALR at 0x121db4; promoted 10 fallback entries
+  [warning] control-flow function=FUN_00122558 addr=0x122610 - unresolved JR/JALR at 0x122610 0x122730 0x12287c; promoted 248 fallback entries
+  [warning] control-flow function=entry_00122600 addr=0x122610 - unresolved JR/JALR at 0x122610; promoted 18 fallback entries
+  [warning] control-flow function=entry_00122718 addr=0x122730 - unresolved JR/JALR at 0x122730; promoted 14 fallback entries
+  [warning] control-flow function=entry_00122864 addr=0x12287c - unresolved JR/JALR at 0x12287c; promoted 13 fallback entries
+  [warning] control-flow function=FUN_00122938 addr=0x122984 - unresolved JR/JALR at 0x122984; promoted 37 fallback entries
+  [warning] control-flow function=entry_00122978 addr=0x122984 - unresolved JR/JALR at 0x122984; promoted 7 fallback entries
+  [warning] control-flow function=entry_00126858 addr=0x126870 - unresolved JR/JALR at 0x126870; promoted 8 fallback entries
+  [warning] control-flow function=entry_0012ac40 addr=0x12acac - unresolved JR/JALR at 0x12acac; promoted 30 fallback entries
+  [warning] control-flow function=entry_0012ea70 addr=0x12ea94 - unresolved JR/JALR at 0x12ea94; promoted 12 fallback entries
+  [warning] control-flow function=entry_0012edc8 addr=0x12edec - unresolved JR/JALR at 0x12edec; promoted 12 fallback entries
+  [warning] control-flow function=entry_00133a08 addr=0x133a3c - unresolved JR/JALR at 0x133a3c; promoted 16 fallback entries
+  [warning] control-flow function=caseD_7 addr=0x135138 - unresolved JR/JALR at 0x135138; promoted 10 fallback entries
+  [warning] control-flow function=entry_00135388 addr=0x1353a8 - unresolved JR/JALR at 0x1353a8; promoted 10 fallback entries
+  [warning] control-flow function=entry_0013ab58 addr=0x13ab64 - unresolved JR/JALR at 0x13ab64; promoted 8 fallback entries
+  [warning] control-flow function=FUN_0013ab00 addr=0x13ab64 - unresolved JR/JALR at 0x13ab64; promoted 120 fallback entries
+  [warning] control-flow function=FUN_0013b220 addr=0x13b31c - unresolved JR/JALR at 0x13b31c 0x13b35c 0x13b3d4 0x13b40c 0x13b45c; promoted 179 fallback entries
+  [warning] control-flow function=entry_0013b310 addr=0x13b31c - unresolved JR/JALR at 0x13b31c; promoted 8 fallback entries
+  [warning] control-flow function=entry_0013b348 addr=0x13b35c - unresolved JR/JALR at 0x13b35c; promoted 10 fallback entries
+  [warning] control-flow function=entry_0013b380 addr=0x13b3d4 - unresolved JR/JALR at 0x13b3d4; promoted 24 fallback entries
+  [warning] control-flow function=entry_0013b400 addr=0x13b40c - unresolved JR/JALR at 0x13b40c; promoted 6 fallback entries
+  [warning] control-flow function=entry_0013b440 addr=0x13b45c - unresolved JR/JALR at 0x13b45c; promoted 12 fallback entries
+  [warning] control-flow function=FUN_0014d8e0 addr=0x14d91c - unresolved JR/JALR at 0x14d91c; promoted 21 fallback entries
+  [warning] control-flow function=entry_0014d900 addr=0x14d91c - unresolved JR/JALR at 0x14d91c; promoted 10 fallback entries
+  [warning] control-flow function=FUN_0014d940 addr=0x14d97c - unresolved JR/JALR at 0x14d97c; promoted 21 fallback entries
+  [warning] control-flow function=FUN_0014d9a0 addr=0x14d9dc - unresolved JR/JALR at 0x14d9dc; promoted 21 fallback entries
+  [warning] control-flow function=entry_0014d9c0 addr=0x14d9dc - unresolved JR/JALR at 0x14d9dc; promoted 10 fallback entries
+  [warning] control-flow function=entry_0014d960 addr=0x14d97c - unresolved JR/JALR at 0x14d97c; promoted 10 fallback entries
+  [warning] control-flow function=entry_00164dc0 addr=0x164dfc - unresolved JR/JALR at 0x164dfc; promoted 18 fallback entries
+  [warning] control-flow function=entry_00165298 addr=0x1652c8 - unresolved JR/JALR at 0x1652c8; promoted 14 fallback entries
+  [warning] control-flow function=entry_00165508 addr=0x165528 - unresolved JR/JALR at 0x165528; promoted 10 fallback entries
+  [warning] control-flow function=entry_001655f8 addr=0x165628 - unresolved JR/JALR at 0x165628; promoted 14 fallback entries
+  [warning] control-flow function=entry_00165878 addr=0x165898 - unresolved JR/JALR at 0x165898; promoted 10 fallback entries
+  [warning] control-flow function=entry_00165ee0 addr=0x165f08 - unresolved JR/JALR at 0x165f08; promoted 12 fallback entries
+  [warning] control-flow function=entry_00165fa0 addr=0x165fc0 - unresolved JR/JALR at 0x165fc0; promoted 10 fallback entries
+  [warning] control-flow function=FUN_00166170 addr=0x166890 - unresolved JR/JALR at 0x166890 0x1668bc 0x1668ec 0x166914; promoted 512 fallback entries
+  [warning] control-flow function=entry_00166850 addr=0x166890 - unresolved JR/JALR at 0x166890; promoted 20 fallback entries
+  [warning] control-flow function=entry_001668a0 addr=0x1668bc - unresolved JR/JALR at 0x1668bc; promoted 12 fallback entries
+  [warning] control-flow function=entry_001668d0 addr=0x1668ec - unresolved JR/JALR at 0x1668ec; promoted 12 fallback entries
+  [warning] control-flow function=entry_00166900 addr=0x166914 - unresolved JR/JALR at 0x166914; promoted 8 fallback entries
+  [warning] control-flow function=FUN_001717a0 addr=0x171914 - unresolved JR/JALR at 0x171914; promoted 120 fallback entries
+  [warning] control-flow function=entry_00171900 addr=0x171914 - unresolved JR/JALR at 0x171914; promoted 8 fallback entries
+  [warning] control-flow function=FUN_0017f5c0 addr=0x17f5fc - unresolved JR/JALR at 0x17f5fc; promoted 35 fallback entries
+  [warning] control-flow function=entry_0017f5e0 addr=0x17f5fc - unresolved JR/JALR at 0x17f5fc; promoted 12 fallback entries
+  [warning] control-flow function=FUN_0017f650 addr=0x17f6d8 - unresolved JR/JALR at 0x17f6d8 0x17f724 0x17f740; promoted 89 fallback entries
+  [warning] control-flow function=entry_0017f6b8 addr=0x17f6d8 - unresolved JR/JALR at 0x17f6d8; promoted 18 fallback entries
+  [warning] control-flow function=entry_0017f708 addr=0x17f724 - unresolved JR/JALR at 0x17f724; promoted 10 fallback entries
+  [warning] control-flow function=entry_0017f730 addr=0x17f740 - unresolved JR/JALR at 0x17f740; promoted 8 fallback entries
+  [warning] control-flow function=FUN_001829b0 addr=0x182bc0 - unresolved JR/JALR at 0x182bc0; promoted 152 fallback entries
+  [warning] control-flow function=entry_00182a10 addr=0x182bc0 - unresolved JR/JALR at 0x182bc0; promoted 116 fallback entries
+  [warning] control-flow function=entry_00185208 addr=0x185228 - unresolved JR/JALR at 0x185228; promoted 10 fallback entries
+  [warning] control-flow function=FUN_00189f40 addr=0x18a008 - unresolved JR/JALR at 0x18a008 0x18a068 0x18a0c8; promoted 175 fallback entries
+  [warning] control-flow function=entry_00189f90 addr=0x18a008 - unresolved JR/JALR at 0x18a008; promoted 34 fallback entries
+  [warning] control-flow function=entry_0018a018 addr=0x18a068 - unresolved JR/JALR at 0x18a068; promoted 24 fallback entries
+  [warning] control-flow function=entry_0018a078 addr=0x18a0c8 - unresolved JR/JALR at 0x18a0c8; promoted 26 fallback entries
+  [warning] control-flow function=FUN_0018a200 addr=0x18a2b4 - unresolved JR/JALR at 0x18a2b4 0x18a2d8; promoted 68 fallback entries
+  [warning] control-flow function=entry_0018a288 addr=0x18a2b4 - unresolved JR/JALR at 0x18a2b4; promoted 14 fallback entries
+  [warning] control-flow function=entry_0018a2c0 addr=0x18a2d8 - unresolved JR/JALR at 0x18a2d8; promoted 8 fallback entries
+  [warning] control-flow function=FUN_0018b180 addr=0x18b2b0 - unresolved JR/JALR at 0x18b2b0; promoted 87 fallback entries
+  [warning] control-flow function=entry_0018b2a0 addr=0x18b2b0 - unresolved JR/JALR at 0x18b2b0; promoted 6 fallback entries
+  [warning] control-flow function=FUN_0018b2e0 addr=0x18b308 - unresolved JR/JALR at 0x18b308; promoted 15 fallback entries
+  [warning] control-flow function=entry_0018bdf8 addr=0x18be28 - unresolved JR/JALR at 0x18be28; promoted 14 fallback entries
+  [warning] control-flow function=entry_0018bfe8 addr=0x18c008 - unresolved JR/JALR at 0x18c008; promoted 10 fallback entries
+  [warning] control-flow function=entry_0018caf8 addr=0x18cb40 - unresolved JR/JALR at 0x18cb40; promoted 20 fallback entries
+  [warning] control-flow function=entry_0018db00 addr=0x18db28 - unresolved JR/JALR at 0x18db28; promoted 12 fallback entries
+  [warning] control-flow function=entry_00192240 addr=0x192274 - unresolved JR/JALR at 0x192274; promoted 16 fallback entries
+  [warning] control-flow function=entry_00192438 addr=0x192458 - unresolved JR/JALR at 0x192458; promoted 10 fallback entries
+  [warning] control-flow function=entry_00194690 addr=0x1946b8 - unresolved JR/JALR at 0x1946b8; promoted 12 fallback entries
+  [warning] control-flow function=entry_0019bd60 addr=0x19bd88 - unresolved JR/JALR at 0x19bd88; promoted 12 fallback entries
+  [warning] control-flow function=entry_0019bef0 addr=0x19bf18 - unresolved JR/JALR at 0x19bf18; promoted 12 fallback entries
+  [warning] control-flow function=entry_0019c150 addr=0x19c180 - unresolved JR/JALR at 0x19c180; promoted 14 fallback entries
+  [warning] control-flow function=entry_0019c2c0 addr=0x19c2f0 - unresolved JR/JALR at 0x19c2f0; promoted 14 fallback entries
+  [warning] control-flow function=caseD_7 addr=0x19c370 - unresolved JR/JALR at 0x19c370; promoted 16 fallback entries
+  [warning] control-flow function=FUN_0019c6d0 addr=0x19c6ec - unresolved JR/JALR at 0x19c6ec; promoted 181 fallback entries
+  [warning] control-flow function=entry_0019d630 addr=0x19d668 - unresolved JR/JALR at 0x19d668; promoted 16 fallback entries
+  [warning] control-flow function=entry_0019d750 addr=0x19d790 - unresolved JR/JALR at 0x19d790; promoted 18 fallback entries
+  [warning] control-flow function=entry_001a1818 addr=0x1a1834 - unresolved JR/JALR at 0x1a1834; promoted 10 fallback entries
+  [warning] control-flow function=entry_001a1bc8 addr=0x1a1bec - unresolved JR/JALR at 0x1a1bec; promoted 12 fallback entries
+  [warning] control-flow function=entry_001a1ce8 addr=0x1a1d24 - unresolved JR/JALR at 0x1a1d24; promoted 18 fallback entries
+  [warning] control-flow function=entry_001a1eb0 addr=0x1a1ee0 - unresolved JR/JALR at 0x1a1ee0; promoted 14 fallback entries
+  [warning] control-flow function=entry_001a1fb0 addr=0x1a2028 - unresolved JR/JALR at 0x1a2028; promoted 32 fallback entries
+  [warning] control-flow function=entry_001a2118 addr=0x1a2140 - unresolved JR/JALR at 0x1a2140; promoted 12 fallback entries
+  [warning] control-flow function=entry_001a2298 addr=0x1a2308 - unresolved JR/JALR at 0x1a2308; promoted 30 fallback entries
+  [warning] control-flow function=entry_001a23a0 addr=0x1a23c0 - unresolved JR/JALR at 0x1a23c0; promoted 10 fallback entries
+  [warning] control-flow function=entry_001a24b8 addr=0x1a2528 - unresolved JR/JALR at 0x1a2528; promoted 30 fallback entries
+  [warning] control-flow function=entry_001a25c0 addr=0x1a25e0 - unresolved JR/JALR at 0x1a25e0; promoted 10 fallback entries
+  [warning] control-flow function=entry_001a45b4 addr=0x1a45d4 - unresolved JR/JALR at 0x1a45d4; promoted 11 fallback entries
+  [warning] control-flow function=entry_001a4c10 addr=0x1a4c50 - unresolved JR/JALR at 0x1a4c50; promoted 18 fallback entries
+  [warning] control-flow function=FUN_001a7420 addr=0x1a76bc - unresolved JR/JALR at 0x1a76bc; promoted 251 fallback entries
+  [warning] control-flow function=entry_001a7608 addr=0x1a76bc - unresolved JR/JALR at 0x1a76bc; promoted 48 fallback entries
+  [warning] control-flow function=entry_001ab8a0 addr=0x1ab8cc - unresolved JR/JALR at 0x1ab8cc; promoted 14 fallback entries
+  [warning] control-flow function=FUN_001ac820 addr=0x1ac908 - unresolved JR/JALR at 0x1ac908; promoted 347 fallback entries
+  [warning] control-flow function=entry_001ac8e0 addr=0x1ac908 - unresolved JR/JALR at 0x1ac908; promoted 22 fallback entries
+  [warning] control-flow function=entry_001b01c0 addr=0x1b01f8 - unresolved JR/JALR at 0x1b01f8; promoted 16 fallback entries
+  [warning] control-flow function=FUN_001b37f0 addr=0x1b3a34 - unresolved JR/JALR at 0x1b3a34; promoted 463 fallback entries
+  [warning] control-flow function=entry_001b3a08 addr=0x1b3a34 - unresolved JR/JALR at 0x1b3a34; promoted 37 fallback entries
+  [warning] control-flow function=FUN_001b8a60 addr=0x1b8c30 - unresolved JR/JALR at 0x1b8c30; promoted 308 fallback entries
+  [warning] control-flow function=entry_001b8c28 addr=0x1b8c30 - unresolved JR/JALR at 0x1b8c30; promoted 12 fallback entries
+  [warning] control-flow function=entry_001bac98 addr=0x1baccc - unresolved JR/JALR at 0x1baccc; promoted 16 fallback entries
+  [warning] control-flow function=entry_001bb460 addr=0x1bb490 - unresolved JR/JALR at 0x1bb490; promoted 14 fallback entries
+  [warning] control-flow function=entry_001bc818 addr=0x1bc834 - unresolved JR/JALR at 0x1bc834; promoted 10 fallback entries
+  [warning] control-flow function=entry_001c5ff0 addr=0x1c6018 - unresolved JR/JALR at 0x1c6018; promoted 12 fallback entries
+  [warning] control-flow function=entry_001c6290 addr=0x1c62b8 - unresolved JR/JALR at 0x1c62b8; promoted 12 fallback entries
+  [warning] control-flow function=entry_001c65e8 addr=0x1c663c - unresolved JR/JALR at 0x1c663c; promoted 24 fallback entries
+  [warning] control-flow function=entry_001c6a60 addr=0x1c6a9c - unresolved JR/JALR at 0x1c6a9c; promoted 18 fallback entries
+  [warning] control-flow function=entry_001c6df0 addr=0x1c6e2c - unresolved JR/JALR at 0x1c6e2c; promoted 18 fallback entries
+  [warning] control-flow function=entry_001cbd70 addr=0x1cbdb0 - unresolved JR/JALR at 0x1cbdb0; promoted 18 fallback entries
+  [warning] control-flow function=entry_001cd330 addr=0x1cd374 - unresolved JR/JALR at 0x1cd374; promoted 20 fallback entries
+  [warning] control-flow function=entry_001ce890 addr=0x1ce8f0 - unresolved JR/JALR at 0x1ce8f0; promoted 26 fallback entries
+  [warning] control-flow function=FUN_001d8ab0 addr=0x1d8af8 - unresolved JR/JALR at 0x1d8af8; promoted 73 fallback entries
+  [warning] control-flow function=FUN_001da340 addr=0x1da3c4 - unresolved JR/JALR at 0x1da3c4 0x1da404 0x1da44c 0x1da48c; promoted 108 fallback entries
+  [warning] control-flow function=entry_001da3b0 addr=0x1da3c4 - unresolved JR/JALR at 0x1da3c4 0x1da404; promoted 38 fallback entries
+  [warning] control-flow function=entry_001da448 addr=0x1da44c - unresolved JR/JALR at 0x1da44c 0x1da48c; promoted 34 fallback entries
+  [warning] control-flow function=entry_001db070 addr=0x1db0a4 - unresolved JR/JALR at 0x1db0a4; promoted 16 fallback entries
+  [warning] control-flow function=entry_001ddd08 addr=0x1ddd38 - unresolved JR/JALR at 0x1ddd38; promoted 14 fallback entries
+  [warning] control-flow function=entry_001de4f0 addr=0x1de524 - unresolved JR/JALR at 0x1de524; promoted 16 fallback entries
+  [warning] control-flow function=entry_001dede0 addr=0x1dee00 - unresolved JR/JALR at 0x1dee00; promoted 10 fallback entries
+  [warning] control-flow function=entry_001df0d0 addr=0x1df0f0 - unresolved JR/JALR at 0x1df0f0; promoted 10 fallback entries
+  [warning] control-flow function=entry_001df168 addr=0x1df1a8 - unresolved JR/JALR at 0x1df1a8; promoted 18 fallback entries
+  [warning] control-flow function=FUN_001dfcb0 addr=0x1dfdc0 - unresolved JR/JALR at 0x1dfdc0 0x1dfeb8; promoted 138 fallback entries
+  [warning] control-flow function=entry_001dfd88 addr=0x1dfdc0 - unresolved JR/JALR at 0x1dfdc0; promoted 16 fallback entries
+  [warning] control-flow function=entry_001dfe98 addr=0x1dfeb8 - unresolved JR/JALR at 0x1dfeb8; promoted 10 fallback entries
+  [warning] control-flow function=FUN_001dfee0 addr=0x1dff80 - unresolved JR/JALR at 0x1dff80 0x1dfff8; promoted 78 fallback entries
+  [warning] control-flow function=entry_001dff48 addr=0x1dff80 - unresolved JR/JALR at 0x1dff80; promoted 16 fallback entries
+  [warning] control-flow function=entry_001dffd8 addr=0x1dfff8 - unresolved JR/JALR at 0x1dfff8; promoted 10 fallback entries
+  [warning] control-flow function=entry_001e0308 addr=0x1e0330 - unresolved JR/JALR at 0x1e0330; promoted 14 fallback entries
+  [warning] control-flow function=FUN_001e02c0 addr=0x1e0330 - unresolved JR/JALR at 0x1e0330; promoted 61 fallback entries
+  [warning] control-flow function=FUN_001e03c0 addr=0x1e0418 - unresolved JR/JALR at 0x1e0418 0x1e046c; promoted 103 fallback entries
+  [warning] control-flow function=entry_001e0400 addr=0x1e0418 - unresolved JR/JALR at 0x1e0418; promoted 14 fallback entries
+  [warning] control-flow function=entry_001e0448 addr=0x1e046c - unresolved JR/JALR at 0x1e046c; promoted 12 fallback entries
+  [warning] control-flow function=FUN_001e0680 addr=0x1e07ec - unresolved JR/JALR at 0x1e07ec 0x1e0888 0x1e08c4 0x1e08f8 0x1e096c 0x1e09b0 0x1e0a4c; promoted 265 fallback entries
+  [warning] control-flow function=entry_001e07c0 addr=0x1e07ec - unresolved JR/JALR at 0x1e07ec; promoted 15 fallback entries
+  [warning] control-flow function=entry_001e0878 addr=0x1e0888 - unresolved JR/JALR at 0x1e0888; promoted 8 fallback entries
+  [warning] control-flow function=entry_001e089c addr=0x1e08c4 - unresolved JR/JALR at 0x1e08c4; promoted 15 fallback entries
+  [warning] control-flow function=entry_001e08d8 addr=0x1e08f8 - unresolved JR/JALR at 0x1e08f8; promoted 10 fallback entries
+  [warning] control-flow function=entry_001e0928 addr=0x1e096c - unresolved JR/JALR at 0x1e096c; promoted 21 fallback entries
+  [warning] control-flow function=entry_001e0998 addr=0x1e09b0 - unresolved JR/JALR at 0x1e09b0; promoted 10 fallback entries
+  [warning] control-flow function=entry_001e0a08 addr=0x1e0a4c - unresolved JR/JALR at 0x1e0a4c; promoted 20 fallback entries
+  [warning] control-flow function=FUN_001e0ab0 addr=0x1e0b28 - unresolved JR/JALR at 0x1e0b28 0x1e0ba8; promoted 86 fallback entries
+  [warning] control-flow function=entry_001e0b18 addr=0x1e0b28 - unresolved JR/JALR at 0x1e0b28; promoted 20 fallback entries
+  [warning] control-flow function=entry_001e0b98 addr=0x1e0ba8 - unresolved JR/JALR at 0x1e0ba8; promoted 12 fallback entries
+  [warning] control-flow function=entry_001e13b0 addr=0x1e13d8 - unresolved JR/JALR at 0x1e13d8; promoted 12 fallback entries
+  [warning] control-flow function=entry_001e1b70 addr=0x1e1ba8 - unresolved JR/JALR at 0x1e1ba8; promoted 16 fallback entries
+  [warning] control-flow function=entry_001e2d80 addr=0x1e2dcc - unresolved JR/JALR at 0x1e2dcc; promoted 22 fallback entries
+  [warning] control-flow function=FUN_001e3ca0 addr=0x1e3d28 - unresolved JR/JALR at 0x1e3d28 0x1e3d40; promoted 70 fallback entries
+  [warning] control-flow function=entry_001e3d28 addr=0x1e3d28 - unresolved JR/JALR at 0x1e3d28 0x1e3d40; promoted 8 fallback entries
+  [warning] control-flow function=FUN_001e4bb8 addr=0x1e4bec - unresolved JR/JALR at 0x1e4bec; promoted 53 fallback entries
+  [warning] control-flow function=FUN_001e4d18 addr=0x1e4d44 - unresolved JR/JALR at 0x1e4d44; promoted 129 fallback entries
+  [warning] control-flow function=entry_001e8540 addr=0x1e8560 - unresolved JR/JALR at 0x1e8560; promoted 10 fallback entries
+  [warning] control-flow function=FUN_001ecab0 addr=0x1ecb28 - unresolved JR/JALR at 0x1ecb28; promoted 367 fallback entries
+  [warning] control-flow function=entry_001ecb00 addr=0x1ecb28 - unresolved JR/JALR at 0x1ecb28; promoted 18 fallback entries
+  [warning] control-flow function=entry_001eedf0 addr=0x1eee18 - unresolved JR/JALR at 0x1eee18; promoted 14 fallback entries
+  [warning] control-flow function=FUN_001eec98 addr=0x1eecec - unresolved JR/JALR at 0x1eecec 0x1eed04 0x1eed14 0x1eed24 0x1eed34 0x1eed44 0x1eed54; promoted 52 fallback entries
+  [warning] control-flow function=entry_001eecb8 addr=0x1eecec - unresolved JR/JALR at 0x1eecec 0x1eed04 0x1eed14 0x1eed24 0x1eed34 0x1eed44 0x1eed54; promoted 44 fallback entries
+  [warning] control-flow function=FUN_001eed68 addr=0x1eedd0 - unresolved JR/JALR at 0x1eedd0 0x1eede4 0x1eee18 0x1eee28 0x1eee34 0x1eee54 0x1eee64 0x1eeea0 0x1eef00 0x1eef10; promoted 121 fallback entries
+  [warning] control-flow function=entry_001eee28 addr=0x1eee28 - unresolved JR/JALR at 0x1eee28 0x1eee34; promoted 6 fallback entries
+  [warning] control-flow function=entry_001eee40 addr=0x1eee54 - unresolved JR/JALR at 0x1eee54 0x1eee64; promoted 20 fallback entries
+  [warning] control-flow function=entry_001eee90 addr=0x1eeea0 - unresolved JR/JALR at 0x1eeea0; promoted 10 fallback entries
+  [warning] control-flow function=entry_001eeeb8 addr=0x1eef00 - unresolved JR/JALR at 0x1eef00 0x1eef10; promoted 37 fallback entries
+======================================
+Recompilation completed successfully

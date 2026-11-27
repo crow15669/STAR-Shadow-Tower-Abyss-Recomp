@@ -1,0 +1,96 @@
+Name,Address,Handler,Why
+sceSifStopDma,0x0010BCF0,,GHR list; Aura unique
+sceSifDmaStat,0x0010BDC0,,GHR list; Aura unique
+sceSifSetDma,0x0010BDE0,,GHR list; Aura (alias _sceSifSetDma)
+isceSifSetDma,0x0010BDF0,,GHR list; Aura (alias _isceSifSetDma)
+sceSifSetDChain,0x0010BE00,,GHR list; Aura unique
+isceSifSetDChain,0x0010BE10,,GHR list; Aura unique
+sceSifSetReg,0x0010BE20,,GHR list; Aura unique
+sceSifGetReg,0x0010BE30,,GHR list; Aura unique
+sceSifGetSreg,0x0010DB50,,GHR list; Aura unique
+sceSifSetSreg,0x0010DB68,,GHR list; Aura unique
+sceSifGetDataTable,0x0010DB88,,GHR list; Aura (generic body at 8 places; this one sits between sceSifSetSreg and sceSifInitCmd)
+sceSifInitCmd,0x0010DB98,,GHR list; Aura unique
+sceSifExitCmd,0x0010DE18,,GHR list; Aura unique
+sceSifSetCmdBuffer,0x0010DE50,,GHR list; Aura unique
+sceSifSetSysCmdBuffer,0x0010DE68,,GHR list; Aura unique
+sceSifAddCmdHandler,0x0010DE80,,GHR list; Aura unique
+sceSifRemoveCmdHandler,0x0010DEB0,,GHR list; Aura unique
+sceSifSendCmd,0x0010E010,,GHR list; Aura unique
+sceSifWriteBackDCache,0x0010E1B8,,GHR list; Aura unique; called by sceCdInit
+sceSifInitRpc,0x0010E268,,GHR list; God Hand match (104 words); not in Aura's database
+sceSifExitRpc,0x0010E408,,GHR list; Aura (generic body shared with __default_terminate; right after sceSifInitRpc)
+sceSifGetOtherData,0x0010E680,,GHR list; Aura unique
+sceSifBindRpc,0x0010E8D8,,GHR list; Aura unique; sceCdInit's endless bind loop
+sceSifCallRpc,0x0010EAA8,,GHR list; Aura unique
+sceSifCheckStatRpc,0x0010EC98,,GHR list; Aura unique
+sceSifSetRpcQueue,0x0010ECD8,,GHR list; Aura unique
+sceSifRegisterRpc,0x0010ED70,,GHR list; Aura unique
+sceSifRemoveRpc,0x0010EE40,,GHR list; Aura unique
+sceSifRemoveRpcQueue,0x0010EED8,,GHR list; Aura unique
+sceSifGetNextRequest,0x0010EF68,,GHR list; Aura unique
+sceSifExecRequest,0x0010EFC0,,GHR list; Aura unique
+sceSifRpcLoop,0x0010F188,,GHR list; Aura unique
+sceFsInit,0x0010F838,,GHR list; Aura unique
+sceFsReset,0x0010FA98,,GHR list; Aura unique
+sceOpen,0x0010FAD0,,GHR list; Aura unique
+sceClose,0x0010FD58,,GHR list; Aura unique
+sceLseek,0x0010FED8,,GHR list; Aura unique
+sceRead,0x00110110,,GHR list; Aura unique
+sceWrite,0x00110380,,GHR list; Aura unique
+sceIoctl,0x00110640,,GHR list; Aura unique
+sceSifInitIopHeap,0x00112870,,GHR list; Aura unique
+sceSifAllocIopHeap,0x001128F8,,GHR list; Aura unique
+sceSifAllocSysMemory,0x00112968,,GHR list; Aura unique
+sceSifFreeSysMemory,0x001129E8,,GHR list; Aura (sceSifFreeIopHeap has the same body in this SDK)
+sceSifLoadIopHeap,0x00112A80,,GHR list; Aura unique
+sceSifLoadFileReset,0x00112F50,,GHR list; Aura unique
+sceSifLoadModuleBuffer,0x00113558,,GHR list; Aura unique
+sceSifLoadModule,0x001137C0,,GHR list; Aura unique
+sceSifLoadElfPart,0x00113908,,GHR list; Aura unique
+sceSifLoadElf,0x00113928,,GHR list; Aura unique
+sceSifGetIopAddr,0x00113950,,GHR list; Aura unique
+sceSifSetIopAddr,0x00113A40,,GHR list; Aura unique
+sceSifResetIop,0x00113B20,,GHR list; Aura unique
+sceSifIsAliveIop,0x00113C60,,GHR list; Aura unique
+sceSifSyncIop,0x00113C88,,GHR list; Aura unique
+sceSifRebootIop,0x00113CC0,,GHR list; Aura unique
+sceDeci2Open,0x0010CA80,,GHR list; Aura unique
+sceDeci2Close,0x0010CAC8,,GHR list; Aura unique
+sceDeci2ReqSend,0x0010CAF0,,GHR list; Aura unique
+sceDeci2Poll,0x0010CB20,,GHR list; Aura unique
+sceDeci2ExRecv,0x0010CB48,,GHR list; Aura unique
+sceDeci2ExSend,0x0010CB80,,GHR list; Aura unique
+sceDeci2ExReqSend,0x0010CBB8,,GHR list; Aura unique
+sceDeci2ExLock,0x0010CBE8,,GHR list; Aura unique
+sceDeci2ExUnLock,0x0010CC10,,GHR list; Aura unique
+sceTtyWrite,0x0010CEA0,,GHR list; Aura unique
+sceTtyRead,0x0010CFF0,,GHR list; Aura unique
+sceTtyInit,0x0010D0C0,,GHR list; Aura unique
+scePrintf,0x0010DAC0,,GHR list; Aura unique
+_sceSDC,0x0010C270,,GHR list; Aura unique
+_sceIDC,0x0010C3B0,,GHR list; Aura unique
+sceCdDelayThread,0x00116588,,runtime handler; Aura unique (libcdvd)
+sceCdCallback,0x001165F0,,GHR list; Aura unique
+sceCdInitEeCB,0x001167B0,,GHR list; Aura unique
+sceCdLayerSearchFile,0x00116B88,sceCdSearchFile,GHR alias (layer argument ignored: single-layer disc); Aura unique
+sceCdSearchFile,0x00116EA0,,GHR list; Aura (8-word body shared with 3 unrelated names; libcdvd position) and God Hand match
+sceCdNcmdDiskReady,0x00117030,,GHR list; Aura unique
+sceCdSync,0x001170C8,,GHR list; Aura unique
+sceCdSyncS,0x00117168,,GHR list; Aura unique
+sceCdInit,0x00117348,,GHR list; Aura unique; Ghidra decompile confirms (binds 0x80000592)
+sceCdDiskReady,0x00117628,,GHR list; Aura (alias sceCdDiskReady_old)
+sceCdMmode,0x00117820,,GHR list; Aura unique
+sceCdRead,0x001178E8,,GHR list; Aura unique
+sceCdGetError,0x00117AC8,,GHR list; Aura unique
+sceCdReadClock,0x00117B60,,GHR list; Aura unique
+sceCdStInit,0x00117C58,,streaming (ADX music); runtime handler; Aura unique
+sceCdStStart,0x00117C88,,streaming; runtime handler; Aura unique
+sceCdStSeekF,0x00117CC0,,streaming; runtime handler; Aura unique
+sceCdStSeek,0x00117CF0,,streaming; runtime handler; Aura unique
+sceCdStStop,0x00117D20,,streaming; runtime handler; Aura unique
+sceCdStRead,0x00117D58,,streaming; runtime handler; Aura unique
+sceCdStPause,0x00117EE0,,streaming; runtime handler; Aura unique
+sceCdStResume,0x00117F30,,streaming; runtime handler; Aura unique
+sceCdStStat,0x00117F88,,streaming; runtime handler; Aura unique
+sceCdStream,0x00117FD0,,streaming; runtime handler; Aura unique

@@ -1,0 +1,1542 @@
+// pcsx2gs.dll: the C interface of include/pcsx2gs_api.h over PCSX2's GS (docs/GS_PCSX2.md, phase 2).
+#include <atomic>
+#include <cstring>
+#include <mutex>
+#include "pcsx2gs_api.h"
+#include "pcsx2gs_host.h"
+
+#include "Config.h"
+#include "GS/GS.h"
+#include "GS/Renderers/Common/GSRenderer.h"
+#include "VKDxgiPresent.h" // before DX11, as GS.cpp: g_vkDxgiPresent, the DXGI swap chain under Vulkan
+#ifdef _WIN32
+#include "GS/Renderers/DX11/GSDevice11.h"
+#include <dwmapi.h> // STAR: the screen's refreshes (pcsx2gs::ScreenGrid)
+#pragma comment(lib, "dwmapi.lib")
+#endif
+#include "GS/Renderers/HW/GSTextureReplacements.h"
+#include "GS/Renderers/HW/GSTextureCache.h" // g_texture_cache (DllMain)
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <xmmintrin.h>
+
+// The C interface's functions: the DLL's exports on Windows; on Linux the only symbols libpcsx2gs.so exports (the rest
+// is compiled with hidden visibility).
+#ifdef _WIN32
+#define PCSX2GS_EXPORT extern "C" __declspec(dllexport)
+#else
+#define PCSX2GS_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
+
+namespace pcsx2gs
+{
+    extern std::atomic<uint32_t> g_frame; // below; GSRendererHW::ApplyPreciseDepth starts its lines over each frame
+    extern std::atomic<int> g_presentHold; // below; WritePresentStats
+    // The draw dump (diagnostic: pcsx2gs_set_option("draw_dump", "<file base>"), Shift+F10 in the port): 1 = armed, starts
+    // at the next vsync; 2 = recording the frame (GSRendererHW::KamiteDumpDraw); at the vsync after it,
+    // FinishDrawDump saves the frame's colour and depth and closes the file. GS thread only, but for the arming.
+    std::atomic<int> g_drawDumpState{0};
+    std::FILE *g_drawDumpFile = nullptr;
+    std::string g_drawDumpBase;
+    std::mutex g_drawDumpMutex;
+    std::string g_drawDumpRequest;
+    void FinishDrawDump(); // GSRendererHW.cpp
+    extern std::mutex g_textureAddMutex;  // below (texture_add)
+    extern std::vector<std::string> g_textureAdds;
+    // Texture Filtering's crunchy modes (GSRendererHW.cpp; claude/graphics-options.md): 0 = the game's filtering, 1 = the
+    // 3D unfiltered, 2 = the 3D and the 2D; screen copies always keep the game's. Options "crunchy" (open and live).
+    std::atomic<int> g_crunchy{0};
+}
+
+extern Pcsx2Config EmuConfig;
+
+namespace
+{
+    // PCSX2's renderer runs with the CPU's normal floating-point mode (MXCSR 0x1F80: round to nearest, no
+    // flush-to-zero), as on PCSX2's own GS thread. The port's GS thread takes the game thread's mode (round toward
+    // zero, denormals flushed: the PS2's FPU), which made the renderer's own maths a hair low: TEXA's TA1 0x80 / 255
+    // came out 0.50196075, the shader's * 255 gave 127.99999, and the flashback sepia's CT16 shuffle wrote green's
+    // top bit as 0 (every green >= 128 picked the palette's dark end: the splotches, Nov 1). Every entry sets it.
+    struct HostFpuMode
+    {
+        unsigned saved;
+        HostFpuMode() : saved(_mm_getcsr()) { _mm_setcsr(0x1F80u); }
+        ~HostFpuMode() { _mm_setcsr(saved); }
+        HostFpuMode(const HostFpuMode &) = delete;
+        HostFpuMode &operator=(const HostFpuMode &) = delete;
+    };
+}
+
+
+namespace
+{
+    // The GS reads its privileged registers (PMODE, DISPFBn, CSR...) from this block, in the PS2 layout.
+    alignas(16) u8 g_regs[0x2000] = {};
+    bool g_open = false;
+    WindowInfo g_window;
+#ifndef _WIN32
+    void *g_x11Display = nullptr; // pcsx2gs_set_display: the X11 connection the window handles belong to
+
+    // Direct3D 11 is Windows only: on Linux every graphics API name is Vulkan (a GHR.ini from Windows may say dx11).
+    bool IsVulkanName(const std::string &name)
+    {
+        if (name == "vulkan" || name == "vk")
+            return true;
+        std::fprintf(stderr, "[pcsx2-gs] graphics API \"%s\" is Windows only; Vulkan is used\n", name.c_str());
+        return false;
+    }
+#endif
+
+    // STAR: Shadow Tower Abyss (SLPS-25217) has no gsHWFixes in PCSX2's GameIndex.yaml (compat: 5; checked against
+    // PCSX2 master on 2026-11-22), so every option keeps PCSX2's default. (God Hand: Rearmed set God Hand's two fixes
+    // here: halfPixelOffset 2 and nativeScaling 2.)
+    void ApplyGameFixes(Pcsx2Config::GSOptions &options)
+    {
+        (void)options;
+    }
+
+    std::string lower(std::string text)
+    {
+        for (char &c : text)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return text;
+    }
+
+    // Every texture_add applied so far, in order (a path given again moves to the end): a reopen of the renderer
+    // (pcsx2gs_set_api) starts the replacement list again from the folders, so these go back in after it. GS thread.
+    std::vector<std::string> g_textureAdded;
+
+    void RememberTextureAdd(const std::string &path)
+    {
+        g_textureAdded.erase(std::remove(g_textureAdded.begin(), g_textureAdded.end(), path), g_textureAdded.end());
+        g_textureAdded.push_back(path);
+    }
+
+    // Pcsx2GsOpenParams::options: "key=value;key=value".
+    float g_customAspect = 0.0f; // options "aspect=<width/height>": the image shown in that shape (0 = the open's choice)
+    GSRendererType g_graphicsApi = GSRendererType::VK; // options "api=vulkan|dx11" ([Video] GraphicsAPI; Vulkan by default)
+
+    // "native_scaling": the word (or PCSX2's number) as GSNativeScaling.
+    GSNativeScaling ParseNativeScaling(const std::string &text)
+    {
+        const std::string word = lower(text);
+        if (word == "off")
+            return GSNativeScaling::Off;
+        if (word == "ps2" || word == "native")
+            return GSNativeScaling::Aggressive;
+        if (word == "upscaled")
+            return GSNativeScaling::AggressiveUpscaled;
+        if (word == "normal")
+            return GSNativeScaling::Normal;
+        if (word == "normal_upscaled")
+            return GSNativeScaling::NormalUpscaled;
+        return static_cast<GSNativeScaling>(std::clamp(std::atoi(text.c_str()), 0, 4));
+    }
+
+    // Changed while running (pcsx2gs_set_option "native_scaling" / "aspect" from any thread; the OPTIONS screen's Post
+    // Effects and Aspect Ratio): applied on the GS thread at the next Vsync.
+    std::mutex g_liveMutex;
+    std::string g_liveNativeScaling; // empty: none waiting
+    // The GRAPHICS options changed while running (fxaa, trilinear, anisotropy, brightness_percent): GSOptions keys,
+    // applied together through GSUpdateConfig at the next Vsync. vsync: < 0 = none waiting.
+    std::vector<std::pair<std::string, std::string>> g_liveGs;
+    int g_liveVsync = -1;
+    float g_liveAspect = -1.0f;      // < 0: none waiting; 0 = the PS2's 4:3
+    // The replacement textures changed while running (the port's live switch, K Nov 22): texture_first's new folders
+    // ('|' between; empty = none: the mods' and packs' textures off), and texture_reload (read every folder again).
+    bool g_liveTextureFirstSet = false;
+    std::string g_liveTextureFirst;
+    bool g_liveTextureReload = false;
+    bool g_textureFirstLive = false; // texture_first was changed while running: a reopen keeps that list, not the open's
+    uint32_t g_aspectMode = 0u;      // the last pcsx2gs_set_aspect mode (0 = the game's 4:3, shown in the custom shape)
+    bool g_stretch = false;          // the open's stretch (Pcsx2GsOpenParams)
+
+    // pcsx2gs_set_aspect's mode into the presentation's aspect.
+    void ApplyAspectMode(uint32_t mode)
+    {
+        g_aspectMode = mode;
+        // 3 = 4:3 even with a custom (widescreen) aspect: the port pillarboxes menus drawn for 4:3.
+        EmuConfig.CurrentAspectRatio = mode == 2u ? AspectRatioType::Stretch : mode == 1u ? AspectRatioType::R16_9 : AspectRatioType::R4_3;
+        if (mode == 0u && g_customAspect > 0.0f)
+            EmuConfig.CurrentAspectRatio = AspectRatioType::RAuto4_3_3_2; // the widescreen shape stays
+    }
+
+    // A GRAPHICS option (open and live; claude/graphics-options.md). false: not one of them.
+    bool ApplyGraphicsOption(Pcsx2Config::GSOptions &options, std::string_view key, int value)
+    {
+        if (key == "fxaa")
+            options.FXAA = value != 0;
+        else if (key == "trilinear")
+            options.TriFilter = static_cast<TriFiltering>(std::clamp(value, -1, 2)); // -1 the game's (PS2), 2 forced
+        else if (key == "anisotropy")
+            options.MaxAnisotropy = static_cast<u8>(std::clamp(value, 0, 16));
+        else if (key == "brightness_percent")
+        {
+            // Brightness: 100 % = unchanged; PCSX2's Shade Boost brightness is 50 for that (1..100).
+            options.ShadeBoost_Brightness = static_cast<u8>(std::clamp((value + 1) / 2, 1, 100));
+        }
+        else
+            return false;
+        return true;
+    }
+
+    // Shade Boost (an extra pass) only while one of its values is off its default.
+    void UpdateShadeBoost(Pcsx2Config::GSOptions &options)
+    {
+        options.ShadeBoost = options.ShadeBoost_Brightness != Pcsx2Config::GSOptions::DEFAULT_SHADEBOOST_BRIGHTNESS ||
+                             options.ShadeBoost_Contrast != Pcsx2Config::GSOptions::DEFAULT_SHADEBOOST_CONTRAST ||
+                             options.ShadeBoost_Saturation != Pcsx2Config::GSOptions::DEFAULT_SHADEBOOST_SATURATION ||
+                             options.ShadeBoost_Gamma != Pcsx2Config::GSOptions::DEFAULT_SHADEBOOST_GAMMA;
+    }
+
+    GSVSyncMode VsyncMode(int value)
+    {
+        return value == 1 ? GSVSyncMode::FIFO : value == 2 ? GSVSyncMode::Mailbox : GSVSyncMode::Disabled;
+    }
+
+    // texture_first / texture_reload: the folders listed again (ReloadReplacementMap clears the texture_add images too, so
+    // they go back in, in the order they came: the last image of a name wins), and every texture the GS holds dropped, so
+    // each comes back from its new replacement (or the game's own art).
+    void ApplyLiveTextures(bool setFirst, const std::string &first, bool reload)
+    {
+        if (!setFirst && !reload)
+            return;
+        size_t folders = 0;
+        if (setFirst)
+        {
+            g_textureFirstLive = true;
+            pcsx2gs::ClearFirstTextureFolders();
+            size_t start = 0;
+            while (start <= first.size())
+            {
+                const size_t bar = first.find('|', start);
+                const std::string folder = first.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+                if (!folder.empty())
+                {
+                    pcsx2gs::AddFirstTextureFolder(folder);
+                    ++folders;
+                }
+                if (bar == std::string::npos)
+                    break;
+                start = bar + 1;
+            }
+        }
+        if (!GSConfig.LoadTextureReplacements)
+        {
+            if (pcsx2gs::FirstTextureFolders().empty() && pcsx2gs::ExtraTextureFolders().empty())
+                return;
+            Pcsx2Config::GSOptions options = GSConfig;
+            options.LoadTextureReplacements = true;
+            options.LoadTextureReplacementsAsync = true;
+            EmuConfig.GS = options;
+            GSUpdateConfig(options); // starts the loader and lists the folders
+        }
+        else
+            GSTextureReplacements::ReloadReplacementMap();
+        for (const std::string &path : g_textureAdded)
+            GSTextureReplacements::AddReplacementFile(path);
+        if (g_gs_renderer)
+            g_gs_renderer->PurgeTextureCache(true, false, true);
+        if (setFirst)
+            std::fprintf(stderr, "[pcsx2-gs] replacement textures: %zu folder(s) ahead of the extra ones\n", folders);
+        else
+            std::fprintf(stderr, "[pcsx2-gs] replacement textures read again\n");
+    }
+
+    void ApplyLiveOptions()
+    {
+        std::string scaling;
+        float aspect = -1.0f;
+        std::vector<std::pair<std::string, std::string>> graphics;
+        int vsync = -1;
+        bool textureFirstSet = false, textureReload = false;
+        std::string textureFirst;
+        {
+            std::lock_guard<std::mutex> lock(g_liveMutex);
+            textureFirstSet = g_liveTextureFirstSet;
+            textureFirst.swap(g_liveTextureFirst);
+            textureReload = g_liveTextureReload;
+            g_liveTextureFirstSet = g_liveTextureReload = false;
+            scaling.swap(g_liveNativeScaling);
+            aspect = g_liveAspect;
+            g_liveAspect = -1.0f;
+            graphics.swap(g_liveGs);
+            vsync = g_liveVsync;
+            g_liveVsync = -1;
+        }
+        if (!graphics.empty())
+        {
+            Pcsx2Config::GSOptions options = GSConfig;
+            for (const auto &[key, value] : graphics)
+                ApplyGraphicsOption(options, key, std::atoi(value.c_str()));
+            UpdateShadeBoost(options);
+            // (GSOptions' operator!= is not built here: compat/Pcsx2ConfigGS.cpp has only part of Pcsx2Config.)
+            if (options.FXAA != GSConfig.FXAA || options.TriFilter != GSConfig.TriFilter ||
+                options.MaxAnisotropy != GSConfig.MaxAnisotropy || options.ShadeBoost != GSConfig.ShadeBoost ||
+                options.ShadeBoost_Brightness != GSConfig.ShadeBoost_Brightness)
+            {
+                EmuConfig.GS = options;
+                GSUpdateConfig(options); // trilinear empties the texture cache; anisotropy the sampler cache
+                std::fprintf(stderr, "[pcsx2-gs] graphics: fxaa %d, trilinear %d, anisotropy %u, brightness %u%s\n",
+                             options.FXAA ? 1 : 0, static_cast<int>(options.TriFilter), options.MaxAnisotropy,
+                             options.ShadeBoost_Brightness, options.ShadeBoost ? " (shade boost)" : "");
+            }
+        }
+        if (vsync >= 0 && g_gs_device && g_gs_device->GetVSyncMode() != VsyncMode(vsync))
+        {
+            GSSetVSyncMode(VsyncMode(vsync), false);
+            std::fprintf(stderr, "[pcsx2-gs] vsync: %d\n", vsync);
+        }
+        if (!scaling.empty())
+        {
+            Pcsx2Config::GSOptions options = GSConfig;
+            options.UserHacks_NativeScaling = ParseNativeScaling(scaling);
+            if (options.UserHacks_NativeScaling != GSConfig.UserHacks_NativeScaling)
+            {
+                EmuConfig.GS = options;
+                GSUpdateConfig(options);
+                // The copies drawn the old way go (as GSUpdateConfig does for the texture cache options).
+                if (g_gs_renderer)
+                    g_gs_renderer->PurgeTextureCache(true, true, true);
+                std::fprintf(stderr, "[pcsx2-gs] post effects: %s\n", scaling.c_str());
+            }
+        }
+        ApplyLiveTextures(textureFirstSet, textureFirst, textureReload);
+        if (aspect >= 0.0f && !g_stretch)
+        {
+            g_customAspect = aspect > 0.5f && aspect < 5.0f ? aspect : 0.0f;
+            EmuConfig.CurrentCustomAspectRatio = g_customAspect;
+            EmuConfig.GS.AspectRatio = g_customAspect > 0.0f ? AspectRatioType::RAuto4_3_3_2 : AspectRatioType::R4_3;
+            ApplyAspectMode(g_aspectMode);
+            std::fprintf(stderr, "[pcsx2-gs] aspect: %.4f\n", g_customAspect);
+        }
+    }
+
+    void ApplyOptions(Pcsx2Config::GSOptions &options, const char *text)
+    {
+        if (!text)
+            return;
+        std::string_view rest(text);
+        while (!rest.empty())
+        {
+            const size_t end = rest.find(';');
+            const std::string_view item = rest.substr(0, end);
+            rest = end == std::string_view::npos ? std::string_view() : rest.substr(end + 1);
+            const size_t eq = item.find('=');
+            if (eq == std::string_view::npos)
+                continue;
+            const std::string_view key = item.substr(0, eq);
+            const std::string text = std::string(item.substr(eq + 1));
+            const int value = std::atoi(text.c_str());
+            if (key == "aspect")
+            {
+                // A widescreen game (the port widens the camera itself): PCSX2's patch-driven custom aspect ratio.
+                const float aspect = static_cast<float>(std::atof(text.c_str()));
+                g_customAspect = aspect > 0.5f && aspect < 5.0f ? aspect : 0.0f;
+                continue;
+            }
+            if (key == "api")
+            {
+#ifdef _WIN32
+                g_graphicsApi = (text == "vulkan" || text == "vk") ? GSRendererType::VK : GSRendererType::DX11;
+#else
+                IsVulkanName(lower(text));
+                g_graphicsApi = GSRendererType::VK;
+#endif
+                continue;
+            }
+            if (key == "dxgi_present")
+            {
+#ifdef _WIN32
+                // Vulkan's frames shown through a DXGI swap chain (compat/VKDxgiPresent.h); 0 = Vulkan's own.
+                pcsx2gs::g_vkDxgiPresent = value != 0;
+#endif
+                continue;
+            }
+            if (key == "texture_dir")
+            {
+                // Replacement textures (PNG/DDS in <dir>/replacements), loaded as the game uses them.
+                pcsx2gs::SetTextureFolder(text);
+                options.LoadTextureReplacements = !text.empty();
+                options.LoadTextureReplacementsAsync = true;
+                continue;
+            }
+            if (key == "texture_extra")
+            {
+                // More replacement folders (e.g. a character mod's textures), '|' between them; on even without a pack.
+                size_t start = 0;
+                while (start <= text.size())
+                {
+                    const size_t bar = text.find('|', start);
+                    const std::string folder = text.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+                    if (!folder.empty())
+                        pcsx2gs::AddExtraTextureFolder(folder);
+                    if (bar == std::string::npos)
+                        break;
+                    start = bar + 1;
+                }
+                if (!pcsx2gs::ExtraTextureFolders().empty())
+                {
+                    options.LoadTextureReplacements = true;
+                    options.LoadTextureReplacementsAsync = true;
+                }
+                continue;
+            }
+            if (key == "texture_first")
+            {
+                // Folders searched before the pack's replacements/ (the enabled mods' textures/), '|' between them, the
+                // winner first; on even without a pack. After a live change (a reopen: the graphics API) that list stays.
+                if (g_textureFirstLive)
+                {
+                    if (!pcsx2gs::FirstTextureFolders().empty())
+                        options.LoadTextureReplacements = options.LoadTextureReplacementsAsync = true;
+                    continue;
+                }
+                size_t start = 0;
+                while (start <= text.size())
+                {
+                    const size_t bar = text.find('|', start);
+                    const std::string folder = text.substr(start, bar == std::string::npos ? std::string::npos : bar - start);
+                    if (!folder.empty())
+                        pcsx2gs::AddFirstTextureFolder(folder);
+                    if (bar == std::string::npos)
+                        break;
+                    start = bar + 1;
+                }
+                if (!pcsx2gs::FirstTextureFolders().empty())
+                {
+                    options.LoadTextureReplacements = true;
+                    options.LoadTextureReplacementsAsync = true;
+                }
+                continue;
+            }
+            const auto clampU8 = [](int v, int lo, int hi) { return static_cast<u8>(std::clamp(v, lo, hi)); };
+            if (ApplyGraphicsOption(options, key, value)) // fxaa, trilinear, anisotropy, brightness_percent
+                UpdateShadeBoost(options);
+            else if (key == "crunchy")
+                pcsx2gs::g_crunchy.store(std::clamp(value, 0, 2), std::memory_order_relaxed);
+            else if (key == "texture_filtering")
+                options.TextureFiltering = static_cast<BiFiltering>(std::clamp(value, 0, 3));
+            else if (key == "cas")
+                options.CASMode = static_cast<GSCASMode>(std::clamp(value, 0, 2));
+            else if (key == "cas_sharpness")
+                options.CAS_Sharpness = clampU8(value, 0, 100);
+            else if (key == "shadeboost")
+                options.ShadeBoost = value != 0;
+            else if (key == "brightness")
+                options.ShadeBoost_Brightness = clampU8(value, 1, 100);
+            else if (key == "contrast")
+                options.ShadeBoost_Contrast = clampU8(value, 1, 100);
+            else if (key == "saturation")
+                options.ShadeBoost_Saturation = clampU8(value, 1, 100);
+            else if (key == "gamma")
+                options.ShadeBoost_Gamma = clampU8(value, 1, 100);
+            else if (key == "tv_shader")
+                options.TVShader = clampU8(value, 0, 7);
+            else if (key == "present_filter")
+                options.LinearPresent = static_cast<GSPostBilinearMode>(std::clamp(value, 0, 2));
+            else if (key == "dithering")
+                options.Dithering = clampU8(value, 0, 3);
+            else if (key == "texture_precache")
+                options.PrecacheTextureReplacements = value != 0;
+            else if (key == "blending")
+                options.AccurateBlendingUnit = static_cast<AccBlendLevel>(std::clamp(value, 0, 5));
+            else if (key == "native_scaling")
+            {
+                // The game's post effects (depth of field, the heat haze) are drawn from downscaled copies of the
+                // frame. PCSX2's fix for the game ("ps2", Aggressive) draws those copies at the PS2's resolution, which
+                // keeps them aligned but leaves the blur grainy at high internal resolutions; "upscaled"
+                // (AggressiveUpscaled) keeps the copies at the internal resolution where the draw is a plain blend;
+                // "off" leaves everything upscaled (the effects may misalign). Numbers are PCSX2's own enum.
+                options.UserHacks_NativeScaling = ParseNativeScaling(text);
+            }
+            else if (key == "gpu_palette")
+                options.GPUPaletteConversion = value != 0;
+            else if (key == "texture_preloading")
+                options.TexturePreloading = static_cast<TexturePreloadingLevel>(std::clamp(value, 0, 2));
+            else if (key == "partial_invalidation")
+                options.UserHacks_DisablePartialInvalidation = value == 0;
+            else if (key == "half_pixel_offset")
+                options.UserHacks_HalfPixelOffset = static_cast<GSHalfPixelOffset>(std::clamp(value, 0, 5)); // 2 = the game's fix
+        }
+    }
+
+    int Open(const Pcsx2GsOpenParams *params)
+    {
+        const HostFpuMode fpu;
+        if (g_open || !params || !params->hwnd)
+            return 0;
+        g_window = {};
+#ifdef _WIN32
+        g_window.type = WindowInfo::Type::Win32;
+#else
+        // hwnd is an X11 window id, of the connection pcsx2gs_set_display gave (VK_KHR_xlib_surface needs both).
+        if (!g_x11Display)
+        {
+            std::fprintf(stderr, "[pcsx2-gs] no X11 display (pcsx2gs_set_display): cannot open\n");
+            return 0;
+        }
+        g_window.type = WindowInfo::Type::X11;
+        g_window.display_connection = g_x11Display;
+#endif
+        g_window.window_handle = params->hwnd;
+        g_window.surface_width = std::max(1u, params->width);
+        g_window.surface_height = std::max(1u, params->height);
+        pcsx2gs::SetRenderWindow(g_window);
+        pcsx2gs::SetFolders(params->resources ? params->resources : "", params->cache ? params->cache : "");
+        // No texture_dir: PCSX2's own pack folder points nowhere (not <cwd>/SLPS-25217); the port hands its packs over
+        // as texture_first.
+        pcsx2gs::SetTextureFolder(std::string(params->cache ? params->cache : ".") + "/no-texture-pack/SLPS-25217");
+
+        Pcsx2Config::GSOptions options;
+        options.UpscaleMultiplier = std::max(1.0f, params->scale);
+        options.AspectRatio = params->stretch ? AspectRatioType::Stretch : AspectRatioType::R4_3;
+        ApplyGameFixes(options);
+        g_customAspect = 0.0f;
+        g_stretch = params->stretch != 0;
+        g_graphicsApi = GSRendererType::VK;
+        ApplyOptions(options, params->options);
+        options.Renderer = g_graphicsApi;
+        if (g_customAspect > 0.0f && !params->stretch)
+            options.AspectRatio = AspectRatioType::RAuto4_3_3_2;
+        EmuConfig.CurrentCustomAspectRatio = g_customAspect;
+        EmuConfig.GS = options;
+        // The presentation reads the current aspect ratio (PCSX2's VMManager copies it from GS.AspectRatio at boot);
+        // without it [Video] Stretch=1 still drew 4:3 (PROGRESS §100).
+        EmuConfig.CurrentAspectRatio = options.AspectRatio;
+
+        const GSVSyncMode vsync = params->vsync == 1u ? GSVSyncMode::FIFO
+                                  : params->vsync == 2u ? GSVSyncMode::Mailbox
+                                                        : GSVSyncMode::Disabled;
+        bool opened = GSopen(options, options.Renderer, g_regs, vsync, false);
+#ifdef _WIN32
+        if (!opened && options.Renderer == GSRendererType::VK)
+        {
+            // Vulkan could not start (no driver, or shaderc_shared.dll missing): Direct3D 11 instead.
+            std::fprintf(stderr, "[pcsx2-gs] Vulkan failed to open; falling back to Direct3D 11\n");
+            options.Renderer = GSRendererType::DX11;
+            EmuConfig.GS.Renderer = GSRendererType::DX11;
+            opened = GSopen(options, options.Renderer, g_regs, vsync, false);
+        }
+#endif
+        if (!opened)
+        {
+            std::fprintf(stderr, "[pcsx2-gs] GSopen failed\n");
+            return 0;
+        }
+        g_open = true;
+        int w = 0, h = 0;
+        GSgetInternalResolution(&w, &h);
+        std::fprintf(stderr, "[pcsx2-gs] %s, scale %.0f (%dx%d), window %ux%u, options: %s\n",
+                     options.Renderer == GSRendererType::VK ? "Vulkan" : "DX11", options.UpscaleMultiplier, w, h,
+                     g_window.surface_width, g_window.surface_height, params->options ? params->options : "");
+        return 1;
+    }
+
+    const char *ApiName(RenderAPI api) { return api == RenderAPI::Vulkan ? "Vulkan" : api == RenderAPI::D3D11 ? "DX11" : "?"; }
+
+    // The graphics API while running (pcsx2gs_set_api).
+    int ReopenApi(const char *api, void *hwnd, uint32_t width, uint32_t height)
+    {
+        const HostFpuMode fpu;
+        if (!g_open || !api || !g_gs_device || !g_gs_renderer)
+            return -1;
+        const std::string name = lower(api);
+#ifndef _WIN32
+        // Vulkan is the only API here and it runs: nothing changes, the new window is not used (the port drops it).
+        IsVulkanName(name);
+        return 2;
+#endif
+        const GSRendererType want = (name == "vulkan" || name == "vk") ? GSRendererType::VK : GSRendererType::DX11;
+        const RenderAPI wantApi = want == GSRendererType::VK ? RenderAPI::Vulkan : RenderAPI::D3D11;
+        if (g_gs_device->GetRenderAPI() == wantApi)
+            return 2; // already running (the new window is not used)
+        // One window cannot carry both kinds of swap chain (PCSX2 makes a new one for this too): the port's new window.
+        if (hwnd)
+        {
+            g_window.window_handle = hwnd;
+            g_window.surface_width = std::max(1u, width);
+            g_window.surface_height = std::max(1u, height);
+            pcsx2gs::SetRenderWindow(g_window);
+        }
+        const Pcsx2Config::GSOptions old = GSConfig;
+        const GSRendererType had = old.Renderer;
+        GSConfig.Renderer = want;
+        EmuConfig.GS.Renderer = want;
+        // The GS state frozen and thawed round a new device and renderer. If the new device fails, PCSX2 opens the old
+        // one again (with the old options) but still makes the renderer for the new type.
+        if (!GSreopen(true, true, want, &old))
+        {
+            std::fprintf(stderr, "[pcsx2-gs] graphics API: the switch to %s failed and the old one did not come back\n",
+                         want == GSRendererType::VK ? "Vulkan" : "DX11");
+            g_open = false;
+            return -1;
+        }
+        const RenderAPI now = g_gs_device->GetRenderAPI();
+        int result = 1;
+        if (now != wantApi)
+        {
+            // Back on the old device: the renderer made again for its type (the texture cache asks which one it is).
+            GSConfig.Renderer = had;
+            EmuConfig.GS.Renderer = had;
+            if (!GSreopen(false, true, had, std::nullopt))
+            {
+                g_open = false;
+                return -1;
+            }
+            result = 0;
+        }
+        // The replacement list was read again from the folders: the images the port added while running go back in
+        // before anything is drawn (the GS decides a texture's replacement the first time it hashes it).
+        for (const std::string &path : g_textureAdded)
+            GSTextureReplacements::AddReplacementFile(path);
+        int w = 0, h = 0;
+        GSgetInternalResolution(&w, &h);
+        std::fprintf(stderr, "[pcsx2-gs] graphics API: %s%s (%dx%d), %zu added replacements restored\n", ApiName(now),
+                     result ? "" : " (the switch failed; kept)", w, h, g_textureAdded.size());
+        return result;
+    }
+
+    void Close()
+    {
+        const HostFpuMode fpu;
+        if (!g_open)
+            return;
+        GSclose();
+        g_open = false;
+    }
+
+    // STAR 2026-11-24. A vsync does housekeeping in the renderer (GSRendererHW::VSync: textures and targets age, the
+    // lists of recent transfers and the draw-skip state start over, the displayed buffer is merged). PCSX2 gets its
+    // vsyncs between a game's frames; here the host runs over each frame several times in the background (the
+    // in-between pictures), so a field's vsync lands wherever such a run happens to be. That was suspected of the
+    // user's flicker and is NOT its cause: a vsync forced into every place of a run (the sweep below, 0.1% steps)
+    // changed no picture. The means to hold a vsync back to the end of a run stay, switched off:
+    // PS2X_PCSX2_VSYNC_HOLD=1: a vsync that comes during a run over a frame waits for the run's end.
+    // PS2X_PCSX2_TEST_VSYNC_IN_PASS=<percent> or sweep:<from>:<to>:<runs> (tests): an extra vsync in every run.
+    std::vector<Pcsx2GsPrivRegs> g_heldVsyncs;
+    void VsyncNow(const Pcsx2GsPrivRegs *regs);
+    void Vsync(const Pcsx2GsPrivRegs *regs);
+    Pcsx2GsPrivRegs g_lastVsyncRegs{};
+    bool g_regsSeen = false;
+
+    void Gif(const uint8_t *data, uint32_t qwc)
+    {
+        const HostFpuMode fpu;
+        if (!g_open || !data || !qwc)
+            return;
+        // the test: "<percent>", or "sweep:<from>:<to>:<runs>" = from one percent to the other, a tenth of a percent
+        // further every <runs> runs, each change written to the log with the clock (ms)
+        static const char *const testText = std::getenv("PS2X_PCSX2_TEST_VSYNC_IN_PASS");
+        static double sweepFrom = -1.0, sweepTo = -1.0;
+        static int sweepRuns = 0;
+        static const double testFixed = []
+        {
+            if (!testText || !*testText)
+                return -1.0;
+            if (std::sscanf(testText, "sweep:%lf:%lf:%d", &sweepFrom, &sweepTo, &sweepRuns) == 3 && sweepRuns > 0)
+                return -2.0;
+            return std::atof(testText);
+        }();
+        static u32 packetsInRun = 0, packetsLastRun = 0, runs = 0;
+        static double testPercent = testFixed;
+        static Pcsx2GsPrivRegs lastRegs{};
+        static bool haveRegs = false;
+        const u32 before = g_gs_renderer ? g_gs_renderer->KeptBoundaries() : 0u;
+        if (g_gs_renderer && g_gs_renderer->KeptDrawing())
+            ++packetsInRun;
+        {
+            // PS2X_PCSX2_TEST_PRESENT_EVERY=<n> (a test): during a run over a frame, the picture kept last is presented
+            // again before every n-th GIF packet: presents in the middle of the drawing, many times as often as usual.
+            static const int every = []
+            { const char *v = std::getenv("PS2X_PCSX2_TEST_PRESENT_EVERY"); return v && *v ? std::atoi(v) : 0; }();
+            if (every > 0 && g_gs_renderer && g_gs_renderer->KeptDrawing() && packetsInRun % static_cast<u32>(every) == 0u)
+                g_gs_renderer->TestPresentNow();
+        }
+        if (testFixed != -1.0 && g_gs_renderer && g_gs_renderer->KeptDrawing() && packetsLastRun > 20u && haveRegs &&
+            packetsInRun == static_cast<u32>(packetsLastRun * testPercent / 100.0))
+            Vsync(&lastRegs);
+        GSgifTransfer(data, qwc);
+        if (g_gs_renderer && g_gs_renderer->KeptBoundaries() != before)
+        {
+            packetsLastRun = packetsInRun;
+            packetsInRun = 0;
+            if (testFixed == -2.0 && ++runs % static_cast<u32>(sweepRuns) == 0u)
+            {
+                testPercent = sweepFrom + 0.1 * static_cast<double>(runs / static_cast<u32>(sweepRuns));
+                if (testPercent > sweepTo)
+                    testPercent = sweepFrom, runs = 0;
+                std::fprintf(stderr, "[vtest] %.1f%% from clock %.1f ms (a run has %u packets)\n", testPercent,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(), packetsLastRun);
+            }
+            else if (testFixed == -2.0 && testPercent < 0.0)
+                testPercent = sweepFrom;
+            // a run is over: the vsyncs that came during it
+            std::vector<Pcsx2GsPrivRegs> held;
+            held.swap(g_heldVsyncs);
+            for (const Pcsx2GsPrivRegs &regs : held)
+            {
+                lastRegs = regs;
+                haveRegs = true;
+                VsyncNow(&regs);
+            }
+        }
+        if (testFixed != -1.0 && g_regsSeen)
+        {
+            lastRegs = g_lastVsyncRegs;
+            haveRegs = true;
+        }
+    }
+
+    // PS2X_PRESENT_STATS=<file>: after each present, the swap chain's frame statistics (which present is on screen
+    // and since which monitor refresh): what the monitor really showed, which the present times alone cannot tell
+    // with mailbox vsync (tools/present_stats.py).
+    void WritePresentStats()
+    {
+#ifdef _WIN32 // the statistics are a DXGI swap chain's; Linux has none
+        static std::FILE *file = []() -> std::FILE *
+        {
+            const char *path = std::getenv("PS2X_PRESENT_STATS");
+            std::FILE *f = (path && *path) ? std::fopen(path, "w") : nullptr;
+            if (f)
+                std::fputs("qpc,last_present,shown_present,shown_refresh,sync_refresh,sync_qpc,hold\n", f);
+            return f;
+        }();
+        // A DXGI swap chain's frame statistics: Direct3D 11's, or Vulkan's when it presents through DXGI.
+        const bool d3d11 = g_gs_device && g_gs_device->GetRenderAPI() == RenderAPI::D3D11;
+        GSDevice11 *device = (file && d3d11) ? GSDevice11::GetInstance() : nullptr;
+        IDXGISwapChain1 *swapChain = device ? device->GetSwapChain()
+                                            : (file && g_gs_device ? pcsx2gs::VKDxgiPresenter::CurrentSwapChain() : nullptr);
+        if (!swapChain)
+            return;
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        UINT last = 0;
+        swapChain->GetLastPresentCount(&last);
+        DXGI_FRAME_STATISTICS stats{};
+        if (FAILED(swapChain->GetFrameStatistics(&stats)))
+            stats = {};
+        std::fprintf(file, "%lld,%u,%u,%u,%u,%lld,%d\n", static_cast<long long>(now.QuadPart), last, stats.PresentCount,
+                     stats.PresentRefreshCount, stats.SyncRefreshCount, static_cast<long long>(stats.SyncQPCTime.QuadPart),
+                     pcsx2gs::g_presentHold.load(std::memory_order_relaxed)); // hold: the last present's (last_present)
+#endif
+    }
+
+    void Vsync(const Pcsx2GsPrivRegs *regs)
+    {
+        if (!g_open || !regs)
+            return;
+        g_lastVsyncRegs = *regs;
+        g_regsSeen = true;
+        static const bool hold = []
+        { const char *v = std::getenv("PS2X_PCSX2_VSYNC_HOLD"); return v && *v == '1'; }();
+        if (hold && g_gs_renderer && g_gs_renderer->KeptDrawing() && g_heldVsyncs.size() < 8u)
+        {
+            g_heldVsyncs.push_back(*regs); // to the end of the run over the frame (Gif)
+            return;
+        }
+        VsyncNow(regs);
+    }
+
+    void VsyncNow(const Pcsx2GsPrivRegs *regs)
+    {
+        const HostFpuMode fpu;
+        if (!g_open || !regs)
+            return;
+        for (u32 i = 0; i < 15u; ++i)
+            std::memcpy(g_regs + i * 0x10u, &regs->regset1[i], 8);
+        std::memcpy(g_regs + 0x1000, &regs->csr, 8);
+        std::memcpy(g_regs + 0x1010, &regs->imr, 8);
+        std::memcpy(g_regs + 0x1040, &regs->busdir, 8);
+        std::memcpy(g_regs + 0x1080, &regs->siglblid, 8);
+        // As PCSX2's MTGS: CSR.FIELD (bit 13) picks the field.
+        pcsx2gs::g_frame.fetch_add(1u, std::memory_order_relaxed);
+        // A frame's draws can all land in the other field (the game at 30 frames a second, e.g. every cutscene: two
+        // empty dumps from K, Nov 1): the recording goes on until a field had draws, at most 8 fields.
+        static int s_dumpFields = 0;
+        if (pcsx2gs::g_drawDumpState.load(std::memory_order_relaxed) == 2 && pcsx2gs::g_drawDumpFile &&
+            std::ftell(pcsx2gs::g_drawDumpFile) == 0 && ++s_dumpFields < 8)
+        {
+        }
+        else if (pcsx2gs::g_drawDumpState.load(std::memory_order_relaxed) == 2)
+        {
+            s_dumpFields = 0;
+            pcsx2gs::FinishDrawDump();
+            std::fprintf(stderr, "[pcsx2-gs] draw dump written: %s.bin, _scene.png, _rt.png, _depth.png\n", pcsx2gs::g_drawDumpBase.c_str());
+            pcsx2gs::g_drawDumpState.store(0, std::memory_order_relaxed);
+        }
+        else if (pcsx2gs::g_drawDumpState.load(std::memory_order_relaxed) == 1)
+        {
+            std::lock_guard<std::mutex> lock(pcsx2gs::g_drawDumpMutex);
+            pcsx2gs::g_drawDumpBase = pcsx2gs::g_drawDumpRequest;
+            pcsx2gs::g_drawDumpFile = std::fopen((pcsx2gs::g_drawDumpBase + ".bin").c_str(), "wb");
+            pcsx2gs::g_drawDumpState.store(pcsx2gs::g_drawDumpFile ? 2 : 0, std::memory_order_relaxed);
+        }
+        {
+            std::vector<std::string> adds;
+            {
+                std::lock_guard<std::mutex> lock(pcsx2gs::g_textureAddMutex);
+                adds.swap(pcsx2gs::g_textureAdds);
+            }
+            for (const std::string &path : adds)
+            {
+                GSTextureReplacements::AddReplacementFile(path);
+                RememberTextureAdd(path);
+            }
+        }
+        ApplyLiveOptions();
+        GSvsync((regs->csr & 0x2000u) ? 0u : 1u, true);
+        WritePresentStats();
+    }
+
+    void Reset()
+    {
+        const HostFpuMode fpu;
+        if (g_open)
+            GSreset(false);
+    }
+
+    void ReadFifo(uint8_t *dst, uint32_t qwc)
+    {
+        const HostFpuMode fpu;
+        if (g_open && dst && qwc)
+            GSInitAndReadFIFO(dst, qwc);
+    }
+
+    void Resize(uint32_t width, uint32_t height)
+    {
+        const HostFpuMode fpu;
+        if (!g_open || width == 0u || height == 0u)
+            return;
+        g_window.surface_width = width;
+        g_window.surface_height = height;
+        pcsx2gs::SetRenderWindow(g_window);
+        GSResizeDisplayWindow(width, height, 1.0f);
+    }
+
+    void SetScale(float scale)
+    {
+        const HostFpuMode fpu;
+        if (!g_open)
+            return;
+        Pcsx2Config::GSOptions options = GSConfig;
+        options.UpscaleMultiplier = std::max(1.0f, scale);
+        EmuConfig.GS = options;
+        GSUpdateConfig(options);
+    }
+
+    // As GSState::Defrost: a hardware reset (the HW renderer empties its texture cache and targets), then the memory.
+    void LoadVram(const uint8_t *data, uint32_t size)
+    {
+        const HostFpuMode fpu;
+        if (!g_open || !data || !g_gs_renderer)
+            return;
+        g_gs_renderer->Reset(true);
+        std::memcpy(g_gs_renderer->m_mem.m_vm8, data, std::min<size_t>(size, g_gs_renderer->m_mem.m_vmsize));
+    }
+
+    uint32_t SaveVram(uint8_t *dst, uint32_t size)
+    {
+        const HostFpuMode fpu;
+        if (!g_open || !dst || !g_gs_renderer)
+            return 0;
+        g_gs_renderer->Flush(GSState::GSFlushReason::SAVESTATE);
+        g_gs_renderer->ReadbackTextureCache();
+        const uint32_t bytes = std::min<uint32_t>(size, g_gs_renderer->m_mem.m_vmsize);
+        std::memcpy(dst, g_gs_renderer->m_mem.m_vm8, bytes);
+        return bytes;
+    }
+
+    // As GSState::InitReadFIFO, for an arbitrary transfer and leaving m_env/m_tr alone.
+    uint32_t ReadLocal(uint8_t *dst, uint32_t size, uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg)
+    {
+        const HostFpuMode fpu;
+        if (!g_open || !dst || !size || !g_gs_renderer)
+            return 0;
+        GIFRegBITBLTBUF blit{bitbltbuf};
+        GIFRegTRXPOS pos{trxpos};
+        GIFRegTRXREG reg{trxreg};
+        g_gs_renderer->Flush(GSState::DOWNLOADFIFO);
+        const GSVector4i rect(pos.SSAX, pos.SSAY, pos.SSAX + reg.RRW, pos.SSAY + reg.RRH);
+        g_gs_renderer->InvalidateLocalMem(blit, rect);
+        int x = pos.SSAX, y = pos.SSAY;
+        g_gs_renderer->m_mem.ReadImageX(x, y, dst, static_cast<int>(size), blit, pos, reg);
+        return size;
+    }
+
+    int Snapshot(const char *path)
+    {
+        const HostFpuMode fpu;
+        u32 width = 0, height = 0;
+        std::vector<u32> pixels;
+        if (!g_open || !path || !GSSaveSnapshotToMemory(0, 0, false, false, &width, &height, &pixels) || !width || !height)
+            return 0;
+        std::FILE *file = std::fopen(path, "wb");
+        if (!file)
+            return 0;
+        const u32 rowBytes = (width * 3u + 3u) & ~3u;
+        const u32 imageBytes = rowBytes * height;
+        u8 header[54] = {'B', 'M'};
+        const auto put32 = [&](u32 offset, u32 value) { std::memcpy(header + offset, &value, 4); };
+        put32(2, 54u + imageBytes);
+        put32(10, 54u);
+        put32(14, 40u);
+        put32(18, width);
+        put32(22, height);
+        header[26] = 1;
+        header[28] = 24;
+        put32(34, imageBytes);
+        std::fwrite(header, 1, sizeof(header), file);
+        std::vector<u8> row(rowBytes, 0);
+        for (u32 y = height; y-- > 0;)
+        {
+            for (u32 x = 0; x < width; ++x)
+            {
+                const u32 c = pixels[static_cast<size_t>(y) * width + x];
+                row[x * 3 + 0] = static_cast<u8>(c >> 16);
+                row[x * 3 + 1] = static_cast<u8>(c >> 8);
+                row[x * 3 + 2] = static_cast<u8>(c);
+            }
+            std::fwrite(row.data(), 1, rowBytes, file);
+        }
+        std::fclose(file);
+        return 1;
+    }
+
+    const Pcsx2GsApi g_api = {PCSX2GS_API_VERSION, Open, Close, Gif, Vsync, Reset, ReadFifo, Resize, SetScale, LoadVram, SaveVram, ReadLocal, pcsx2gs::SetOsd, Snapshot, pcsx2gs::SetMenu, pcsx2gs::MenuInput};
+}
+
+#ifndef _WIN32
+namespace
+{
+    // Linux's DllMain detach below: at exit() the GS objects are left to the OS, not destroyed by the library's static
+    // destructors in an undefined order. An atexit handler runs before the destructors of the statics constructed
+    // before it was registered, and pcsx2gs_get_api registers it after the library has loaded.
+    void ReleaseAtExit()
+    {
+        if (g_texture_cache)
+            (void)g_texture_cache.release();
+        if (g_gs_renderer)
+            (void)g_gs_renderer.release();
+        if (g_gs_device)
+            (void)g_gs_device.release();
+    }
+}
+#endif
+
+PCSX2GS_EXPORT const Pcsx2GsApi *pcsx2gs_get_api(uint32_t version)
+{
+#ifndef _WIN32
+    static const bool registered = std::atexit(ReleaseAtExit) == 0;
+    (void)registered;
+#endif
+    return version == PCSX2GS_API_VERSION ? &g_api : nullptr;
+}
+
+#ifndef _WIN32
+// Linux: the X11 connection (a Display *) the window ids given to open and pcsx2gs_set_api belong to, before open.
+// Exported on its own so that the API table stays the same; Pcsx2GsOpenParams::hwnd is then the X11 window id.
+PCSX2GS_EXPORT void pcsx2gs_set_display(void *display)
+{
+    g_x11Display = display;
+}
+#endif
+
+// Options the port changes while the game runs (the in-game menu), any thread; unknown keys are ignored:
+//   texture_add=<path> a replacement image written while the game runs (the port's button prompts), added at
+//                      the next vsync (GSTextureReplacements::AddReplacementFile)
+//   texture_first=<folders> the folders ahead of the pack ('|' between; empty: none), then every folder listed again
+//                      at the next vsync (the port's live replacement-textures switch); texture_reload=1 lists them again
+//   dof=0/1            the game's depth-of-field composite drawn (1, the default) or skipped (GSRendererHW.cpp)
+//   crunchy=0/1/2, fxaa=0/1, trilinear=-1/2, anisotropy=0..16, brightness_percent=50..150, vsync=0/1/2
+//                      the GRAPHICS options (claude/graphics-options.md); all but crunchy at the next Vsync
+//   precise_depth=0/1  depth from Q for perspective-textured draws (1, the default; GSRendererHW::ApplyPreciseDepth)
+//   perspective_shading=0/1  vertex colour interpolated with perspective (1, the default;
+//                      GSRendererHW::ApplyPerspectiveShading)
+//   see_through=0 | "cx cy rx ry start ramp strength soft ex ey ez mid m00 m01 .. m33"   the see-through oval round
+//                      the player, given every frame by the game (GSRendererHW::ApplySeeThrough): centre and radii in
+//                      GS pixels (primitive coordinates, the 2048 offset included); the distance from the eye (world
+//                      units) where hiding starts and the distance over which it becomes full; strength 0..1; soft
+//                      edge as a fraction of the radius; the eye; the height of the player's middle; the inverse of
+//                      the camera's world-to-screen matrix, row by row (screen x, y, integer depth, 1 -> world). 0 = off.
+namespace pcsx2gs
+{
+    // At start: PS2X_PCSX2_DOF=0 or PS2X_PCSX2_SKIP_DOF=1 turn it off.
+    std::atomic<bool> g_drawDof{[]
+    {
+        const char *dof = std::getenv("PS2X_PCSX2_DOF");
+        const char *skip = std::getenv("PS2X_PCSX2_SKIP_DOF");
+        return !((dof && *dof == '0') || (skip && *skip == '1'));
+    }()};
+    std::atomic<uint32_t> g_frame{0}; // fields presented (Vsync), for GSRendererHW::ApplyPreciseDepth's per-frame lines
+    // STAR 2026-11-25 (GSRendererHW::Draw): drawing targets that get more resolution than the rest. A game that draws
+    // an effect into a small buffer and stretches it over the screen (Shadow Tower Abyss: its shadow volumes, 256x256
+    // for a 640x448 picture) shows the buffer's coarse steps however high the picture's resolution is; such a buffer
+    // can be drawn at the upscale times this factor. PS2X_PCSX2_BOOST_TARGETS="<block>:<width in 64s>[,...]" (hex
+    // block = page x 32) names the buffers; the factor is the option "target_boost" (PS2X_PCSX2_TARGET_BOOST at start;
+    // 1 = as the rest).
+    std::atomic<float> g_targetBoost{[]
+    {
+        const char *value = std::getenv("PS2X_PCSX2_TARGET_BOOST");
+        return value && *value ? std::clamp(static_cast<float>(std::atof(value)), 1.0f, 8.0f) : 1.0f;
+    }()};
+    struct BoostTarget
+    {
+        uint32_t block, width;
+    };
+    const std::vector<BoostTarget> &BoostTargets()
+    {
+        static const std::vector<BoostTarget> targets = []
+        {
+            std::vector<BoostTarget> list;
+            const char *text = std::getenv("PS2X_PCSX2_BOOST_TARGETS");
+            while (text && *text)
+            {
+                BoostTarget target{};
+                if (std::sscanf(text, "%x:%u", &target.block, &target.width) == 2)
+                    list.push_back(target);
+                text = std::strchr(text, ',');
+                if (text)
+                    ++text;
+            }
+            return list;
+        }();
+        return targets;
+    }
+    float TargetBoost(uint32_t block, uint32_t width)
+    {
+        const float boost = g_targetBoost.load(std::memory_order_relaxed);
+        if (boost <= 1.0f)
+            return 1.0f;
+        for (const BoostTarget &target : BoostTargets())
+            if (target.block == block && target.width == width)
+                return boost;
+        return 1.0f;
+    }
+    // the first named buffer: the one the shadow volumes are drawn into
+    bool NamedTarget(uint32_t block, uint32_t width)
+    {
+        const std::vector<BoostTarget> &targets = BoostTargets();
+        return !targets.empty() && targets[0].block == block && targets[0].width == width;
+    }
+    // STAR 2026-11-25 (GSRendererHW::ApplyOwnerShadow): creatures do not shadow themselves. The game counts shadow
+    // volumes in the first named buffer (PS2X_PCSX2_BOOST_TARGETS: Shadow Tower Abyss's 256x256 at block 0x2bc0) against a
+    // copy of the scene's depth (the first PS2X_PCSX2_DEPTH_ALIAS: 0x2300, 640x448). Each draw is told which object it
+    // belongs to (GSState: m_star_owner, from the game's own MARKs); the scene's draws leave their object's number in
+    // the picture's alpha, and a volume is not counted where the picture shows the object that casts it. Option
+    // "no_self_shadow" (PS2X_PCSX2_NO_SELF_SHADOW=1 at start).
+    std::atomic<bool> g_noSelfShadow{[]
+    {
+        const char *value = std::getenv("PS2X_PCSX2_NO_SELF_SHADOW");
+        return value && *value == '1';
+    }()};
+    // STAR 2026-11-26: creature shadows stop at walls (option "shadow_walls", PS2X_PCSX2_SHADOW_WALLS=1 at start):
+    // a volume is not counted on scenery turned away from the shadow light or with scenery between it and the piece
+    // that casts the volume (GSRendererHW::ApplyOwnerShadow, tfx.glsl PS_OWNER_WALLS).
+    std::atomic<bool> g_shadowWalls{[]
+    {
+        const char *value = std::getenv("PS2X_PCSX2_SHADOW_WALLS");
+        return value && *value == '1';
+    }()};
+    bool OwnerSelf()
+    {
+        return g_noSelfShadow.load(std::memory_order_relaxed);
+    }
+    bool OwnerWalls()
+    {
+        return g_shadowWalls.load(std::memory_order_relaxed);
+    }
+    // how far behind the picture's surface a point toward the light may lie and still count as inside the scenery
+    // there (world units; PS2X_PCSX2_WALLS_THICKNESS)
+    float OwnerWallsThickness()
+    {
+        static const float thickness = []
+        {
+            const char *value = std::getenv("PS2X_PCSX2_WALLS_THICKNESS");
+            return value && *value ? static_cast<float>(std::atof(value)) : 150.0f;
+        }();
+        return thickness;
+    }
+    struct Alias;
+    const std::vector<Alias> &DepthAliases(); // below
+    bool OwnerShadow(uint32_t &shadow_block, uint32_t &scene_depth_block, uint32_t &width, uint32_t &height);
+    // STAR 2026-11-25 (GSTextureCache::LookupTarget): a depth buffer that the game makes as a small copy of another one
+    // by way of a 16-bit colour buffer (Shadow Tower Abyss: the scene's depth, 640x448, drawn as a texture into
+    // 256x256 for its shadow volumes to be tested against). Converted the game's way the copy has the 65,536 steps of
+    // 16 bits, and the shadows' edges on a sloping surface come out as terraces; taken straight from the depth buffer
+    // it is a copy of, it keeps that buffer's full values. PS2X_PCSX2_DEPTH_ALIAS="<block>=<source block>:<w>:<h>":
+    // the depth buffer at <block> is the w x h corner of the one at <source block>. With target_boost above 1 only
+    // (the two are one setting for the user).
+    struct Alias
+    {
+        uint32_t block, source, width, height;
+    };
+    const std::vector<Alias> &DepthAliases()
+    {
+        static const std::vector<Alias> list = []
+        {
+            std::vector<Alias> all;
+            const char *text = std::getenv("PS2X_PCSX2_DEPTH_ALIAS");
+            while (text && *text)
+            {
+                Alias alias{};
+                if (std::sscanf(text, "%x=%x:%u:%u", &alias.block, &alias.source, &alias.width, &alias.height) == 4)
+                    all.push_back(alias);
+                text = std::strchr(text, ',');
+                if (text)
+                    ++text;
+            }
+            return all;
+        }();
+        return list;
+    }
+    bool OwnerShadow(uint32_t &shadow_block, uint32_t &scene_depth_block, uint32_t &width, uint32_t &height)
+    {
+        if (!g_noSelfShadow.load(std::memory_order_relaxed) && !g_shadowWalls.load(std::memory_order_relaxed))
+            return false;
+        const std::vector<BoostTarget> &targets = BoostTargets();
+        const std::vector<Alias> &aliases = DepthAliases();
+        if (targets.empty() || aliases.empty())
+            return false;
+        shadow_block = targets[0].block;
+        scene_depth_block = aliases[0].source;
+        width = aliases[0].width;
+        height = aliases[0].height;
+        return true;
+    }
+    bool DepthAlias(uint32_t block, uint32_t &source, uint32_t &width, uint32_t &height)
+    {
+        const std::vector<Alias> &list = DepthAliases();
+        if (list.empty() || g_targetBoost.load(std::memory_order_relaxed) <= 1.0f)
+            return false;
+        for (const Alias &alias : list)
+            if (alias.block == block)
+            {
+                source = alias.source;
+                width = alias.width;
+                height = alias.height;
+                return true;
+            }
+        return false;
+    }
+    // Precise depth (GSRendererHW::ApplyPreciseDepth): PS2X_PCSX2_PRECISE_DEPTH=0 turns it off.
+    std::atomic<bool> g_preciseDepth{[]
+    {
+        const char *value = std::getenv("PS2X_PCSX2_PRECISE_DEPTH");
+        return !(value && *value == '0');
+    }()};
+    // STAR (GSRenderer.cpp, kept pictures): the times at which the host wants its pictures presented, by id, in
+    // nanoseconds of std::chrono::steady_clock. Set with the option fd_times ("id:time,id:time,...") from the host's
+    // VIF worker before the marker with that id goes into the GIF stream; taken on the GS thread at the marker.
+    struct FrameTime
+    {
+        uint32_t id = 0;
+        int64_t time = 0;
+        bool valid = false;
+    };
+    std::mutex g_frameTimeMutex;
+    FrameTime g_frameTimes[256];
+
+    // A kept picture went to the screen (GSRenderer::PresentKept): a line for PS2X_PRESENT_STATS.
+    void NotePresented()
+    {
+        WritePresentStats();
+    }
+
+    bool TakeFrameTime(u32 id, s64 &time)
+    {
+        std::lock_guard<std::mutex> lock(g_frameTimeMutex);
+        FrameTime &entry = g_frameTimes[id & 255u];
+        if (!entry.valid || entry.id != id)
+            return false;
+        time = entry.time;
+        entry.valid = false;
+        return true;
+    }
+
+    s64 FrameClock()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    s64 FrameClockPerSecond()
+    {
+        return 1000000000ll;
+    }
+
+    // STAR (GSRenderer::RingNote): the recorder of the last pictures. The option ring = 0/1 (PS2X_PCSX2_RING at the
+    // start) turns it on; ring_save = <an existing folder> has the GS thread write the pictures there.
+    std::atomic<bool> g_ringOn{[]
+    {
+        const char *value = std::getenv("PS2X_PCSX2_RING");
+        return value && *value == '1';
+    }()};
+    std::mutex g_ringMutex;
+    std::string g_ringSave;
+    bool TakeRingSave(std::string &folder)
+    {
+        std::lock_guard<std::mutex> lock(g_ringMutex);
+        // PS2X_PCSX2_RING_SAVE_AT=<seconds>:<existing folder> (tests): as if asked that long after the start.
+        static const char *const testAt = std::getenv("PS2X_PCSX2_RING_SAVE_AT");
+        static bool testDone = false;
+        static const auto start = std::chrono::steady_clock::now();
+        if (testAt && !testDone)
+        {
+            const char *colon = std::strchr(testAt, ':');
+            if (colon && std::chrono::steady_clock::now() - start >= std::chrono::duration<double>(std::atof(testAt)))
+            {
+                testDone = true;
+                g_ringSave = colon + 1;
+            }
+        }
+        if (g_ringSave.empty())
+            return false;
+        folder.swap(g_ringSave);
+        g_ringSave.clear();
+        return true;
+    }
+
+    // STAR (GSRenderer::KeptSlipFix): the swap chain's statistics. LastPresentCount: the number of the present just
+    // made. ShownPresent: the present last seen on screen and the time (FrameClock) of the refresh it came on.
+#ifdef _WIN32
+    static IDXGISwapChain1 *StatsSwapChain()
+    {
+        if (!g_gs_device)
+            return nullptr;
+        if (g_gs_device->GetRenderAPI() == RenderAPI::D3D11)
+        {
+            GSDevice11 *device = GSDevice11::GetInstance();
+            return device ? device->GetSwapChain() : nullptr;
+        }
+        return pcsx2gs::VKDxgiPresenter::CurrentSwapChain();
+    }
+#endif
+
+    u32 LastPresentCount()
+    {
+#ifdef _WIN32
+        UINT last = 0;
+        if (IDXGISwapChain1 *swapChain = StatsSwapChain())
+            swapChain->GetLastPresentCount(&last);
+        return last;
+#else
+        return 0;
+#endif
+    }
+
+    bool ShownPresent(u32 &count, s64 &time, s64 period)
+    {
+#ifdef _WIN32
+        IDXGISwapChain1 *swapChain = StatsSwapChain();
+        DXGI_FRAME_STATISTICS stats{};
+        LARGE_INTEGER frequency{};
+        if (!swapChain || FAILED(swapChain->GetFrameStatistics(&stats)) || stats.SyncQPCTime.QuadPart == 0 ||
+            !QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+            return false;
+        count = stats.PresentCount;
+        time = static_cast<s64>(static_cast<double>(stats.SyncQPCTime.QuadPart) * (1e9 / static_cast<double>(frequency.QuadPart))) +
+               static_cast<s64>(static_cast<int32_t>(stats.PresentRefreshCount - stats.SyncRefreshCount)) * period;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // STAR (GSRenderer::PaceOrdinary): the screen's refresh period and the time of one of its refreshes, in FrameClock
+    // units (std::chrono::steady_clock is the performance counter on Windows, as the compositor's times are).
+    // STAR_REFRESH_HZ=<rate> replaces the screen with a made-up one, as in the host (src/star/window_watch.cpp).
+    // holds: a present may say how long the picture before it stays (a real screen; STAR_SMOOTH_HOLD=0: never).
+    bool ScreenGrid(s64 &period, s64 &phase, bool &holds)
+    {
+        holds = false;
+        static const double madeUpHz = []
+        { const char *v = std::getenv("STAR_REFRESH_HZ"); return v && *v ? std::atof(v) : 0.0; }();
+        if (madeUpHz >= 10.0)
+        {
+            static const s64 epoch = FrameClock();
+            period = static_cast<s64>(1e9 / madeUpHz);
+            phase = epoch;
+            return true;
+        }
+#ifdef _WIN32
+        DWM_TIMING_INFO info{};
+        info.cbSize = sizeof(info);
+        LARGE_INTEGER frequency{};
+        if (FAILED(DwmGetCompositionTimingInfo(nullptr, &info)) || !QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+            info.qpcRefreshPeriod == 0)
+            return false;
+        const double toNs = 1e9 / static_cast<double>(frequency.QuadPart);
+        period = static_cast<s64>(static_cast<double>(info.qpcRefreshPeriod) * toNs);
+        phase = static_cast<s64>(static_cast<double>(info.qpcVBlank) * toNs);
+        static const bool allowed = []
+        { const char *v = std::getenv("STAR_SMOOTH_HOLD"); return !(v && *v == '0'); }();
+        holds = allowed;
+        return period > 1000000ll && period < 100000000ll; // 10 to 1000 a second
+#else
+        return false;
+#endif
+    }
+
+    // STAR (GSRenderer.cpp, ShrinkForPresent): a picture larger than the window is shrunk by averaging.
+    // PS2X_PCSX2_PRESENT_AREA=0 at start or the option present_area=0 while running: PCSX2's single bilinear sample.
+    // STAR, kept pictures: how many screen refreshes each one is to stay (the option fd_hold; 0 = not said), and the
+    // same for the present being made now (GSRenderer::PresentKept sets it, an ordinary present clears it):
+    // VKDxgiPresenter::Present hands it to DXGI as the sync interval, so Windows itself spaces the pictures evenly.
+    std::atomic<int> g_keptHold{0};
+    std::atomic<int> g_presentHold{0};
+    std::atomic<bool> g_presentArea{[]
+    {
+        const char *value = std::getenv("PS2X_PCSX2_PRESENT_AREA");
+        return !(value && *value == '0');
+    }()};
+    // Perspective shading (GSRendererHW::ApplyPerspectiveShading): PS2X_PCSX2_PERSPECTIVE_SHADING=0 turns it off.
+    std::atomic<bool> g_perspectiveShading{[]
+    {
+        const char *value = std::getenv("PS2X_PCSX2_PERSPECTIVE_SHADING");
+        return !(value && *value == '0');
+    }()};
+}
+
+namespace pcsx2gs
+{
+    struct SeeThroughParams
+    {
+        float cx, cy, rx, ry, start, ramp, strength, soft;
+        float eye[3], mid;
+        float inverse[16]; // row-major
+        float wall;        // the rest of a wall the oval opens: dissolved this much (0..1; K, Nov 16)
+    };
+    // texture_add (any thread) -> added on the GS thread at the next vsync.
+    std::mutex g_textureAddMutex;
+    std::vector<std::string> g_textureAdds;
+    std::atomic<bool> g_seeThroughOn{false};
+    std::atomic<uint32_t> g_seeThroughFrame{0}; // g_frame when it was last given
+    std::mutex g_seeThroughMutex;
+    SeeThroughParams g_seeThrough{};
+
+    // GSRendererHW::ApplySeeThrough (GS thread): false = off, or no frame has brought an oval for 8 fields (the game
+    // stopped sending: a cutscene, a loading screen).
+    bool GetSeeThrough(SeeThroughParams &out)
+    {
+        if (!g_seeThroughOn.load(std::memory_order_relaxed))
+            return false;
+        if (g_frame.load(std::memory_order_relaxed) - g_seeThroughFrame.load(std::memory_order_relaxed) > 8u)
+            return false;
+        std::lock_guard<std::mutex> lock(g_seeThroughMutex);
+        out = g_seeThrough;
+        return true;
+    }
+}
+
+// STAR: presents the kept picture that is due, if any (GSRenderer::PresentPoll). GS thread, called by the host between
+// its GIF data and while it idles. Microseconds until the next one is due; -1 when none is queued.
+PCSX2GS_EXPORT int64_t pcsx2gs_present_poll(void)
+{
+    const HostFpuMode fpu;
+    if (!g_open || !g_gs_renderer)
+        return -1;
+    return g_gs_renderer->PresentPoll();
+}
+
+PCSX2GS_EXPORT void pcsx2gs_set_option(const char *key, const char *value)
+{
+    const HostFpuMode fpu;
+    if (!key || !value)
+        return;
+    if (std::strcmp(key, "see_through") == 0)
+    {
+        pcsx2gs::SeeThroughParams p{};
+        float *f[29] = {&p.cx, &p.cy, &p.rx, &p.ry, &p.start, &p.ramp, &p.strength, &p.soft, &p.eye[0], &p.eye[1], &p.eye[2], &p.mid};
+        for (int i = 0; i < 16; i++)
+            f[12 + i] = &p.inverse[i];
+        f[28] = &p.wall; // optional (an older game sends 28)
+        int read = 0;
+        const char *at = value;
+        for (; read < 29; read++)
+        {
+            char *end = nullptr;
+            const float v = std::strtof(at, &end);
+            if (end == at || !std::isfinite(v))
+                break;
+            *f[read] = v;
+            at = end;
+        }
+        const bool on = read >= 28 && p.rx > 0.5f && p.ry > 0.5f && p.strength > 0.0f && p.ramp > 0.0f;
+        p.wall = read == 29 ? std::fmin(std::fmax(p.wall, 0.0f), 1.0f) : 0.0f;
+        if (on)
+        {
+            std::lock_guard<std::mutex> lock(pcsx2gs::g_seeThroughMutex);
+            pcsx2gs::g_seeThrough = p;
+            pcsx2gs::g_seeThroughFrame.store(pcsx2gs::g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        pcsx2gs::g_seeThroughOn.store(on, std::memory_order_relaxed);
+        return;
+    }
+    if (std::strcmp(key, "texture_add") == 0)
+    {
+        std::lock_guard<std::mutex> lock(pcsx2gs::g_textureAddMutex);
+        pcsx2gs::g_textureAdds.emplace_back(value);
+        return;
+    }
+    if (std::strcmp(key, "texture_first") == 0)
+    {
+        std::lock_guard<std::mutex> lock(g_liveMutex);
+        g_liveTextureFirstSet = true;
+        g_liveTextureFirst = value;
+        return;
+    }
+    if (std::strcmp(key, "texture_reload") == 0)
+    {
+        std::lock_guard<std::mutex> lock(g_liveMutex);
+        g_liveTextureReload = true;
+        return;
+    }
+    if (std::strcmp(key, "native_scaling") == 0)
+    {
+        std::lock_guard<std::mutex> lock(g_liveMutex);
+        g_liveNativeScaling = value;
+        return;
+    }
+    if (std::strcmp(key, "aspect") == 0)
+    {
+        std::lock_guard<std::mutex> lock(g_liveMutex);
+        g_liveAspect = std::max(0.0f, static_cast<float>(std::atof(value)));
+        return;
+    }
+    // The GRAPHICS options (claude/graphics-options.md).
+    if (std::strcmp(key, "fxaa") == 0 || std::strcmp(key, "trilinear") == 0 || std::strcmp(key, "anisotropy") == 0 ||
+        std::strcmp(key, "brightness_percent") == 0)
+    {
+        std::lock_guard<std::mutex> lock(g_liveMutex);
+        g_liveGs.emplace_back(key, value);
+        return;
+    }
+    if (std::strcmp(key, "vsync") == 0)
+    {
+        std::lock_guard<std::mutex> lock(g_liveMutex);
+        g_liveVsync = std::clamp(std::atoi(value), 0, 2);
+        return;
+    }
+    if (std::strcmp(key, "crunchy") == 0)
+    {
+        pcsx2gs::g_crunchy.store(std::clamp(std::atoi(value), 0, 2), std::memory_order_relaxed);
+        return;
+    }
+    if (std::strcmp(key, "dof") == 0)
+        pcsx2gs::g_drawDof.store(*value != '0', std::memory_order_relaxed);
+    else if (std::strcmp(key, "precise_depth") == 0)
+        pcsx2gs::g_preciseDepth.store(*value != '0', std::memory_order_relaxed);
+    else if (std::strcmp(key, "no_self_shadow") == 0) // STAR: GSRendererHW::ApplyOwnerShadow
+        pcsx2gs::g_noSelfShadow.store(*value == '1', std::memory_order_relaxed);
+    else if (std::strcmp(key, "shadow_walls") == 0) // STAR: GSRendererHW::ApplyOwnerShadow, shadows stop at walls
+        pcsx2gs::g_shadowWalls.store(*value == '1', std::memory_order_relaxed);
+    else if (std::strcmp(key, "target_boost") == 0) // STAR: GSRendererHW::Draw, more resolution for the named buffers
+        pcsx2gs::g_targetBoost.store(std::clamp(static_cast<float>(std::atof(value)), 1.0f, 8.0f), std::memory_order_relaxed);
+    else if (std::strcmp(key, "perspective_shading") == 0)
+        pcsx2gs::g_perspectiveShading.store(*value != '0', std::memory_order_relaxed);
+    else if (std::strcmp(key, "swing_mark") == 0) // STAR: HostStubs.cpp, the arrow head of the next swing
+        pcsx2gs::SetSwingMark(std::atoi(value));
+    else if (std::strcmp(key, "ring") == 0) // STAR: GSRenderer.cpp, the last pictures
+        pcsx2gs::g_ringOn.store(*value == '1', std::memory_order_relaxed);
+    else if (std::strcmp(key, "ring_save") == 0)
+    {
+        std::lock_guard<std::mutex> lock(pcsx2gs::g_ringMutex);
+        pcsx2gs::g_ringSave = value;
+    }
+    else if (std::strcmp(key, "fd_hold") == 0) // STAR: GSRenderer.cpp, kept pictures
+        pcsx2gs::g_keptHold.store(std::clamp(std::atoi(value), 0, 4), std::memory_order_relaxed);
+    else if (std::strcmp(key, "fd_times") == 0) // STAR: GSRenderer.cpp, kept pictures
+    {
+        std::lock_guard<std::mutex> lock(pcsx2gs::g_frameTimeMutex);
+        const char *p = value;
+        while (*p)
+        {
+            char *end = nullptr;
+            const unsigned long id = std::strtoul(p, &end, 10);
+            if (end == p || *end != ':')
+                break;
+            p = end + 1;
+            const long long time = std::strtoll(p, &end, 10);
+            if (end == p)
+                break;
+            pcsx2gs::g_frameTimes[id & 255u] = pcsx2gs::FrameTime{static_cast<uint32_t>(id), time, true};
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+    else if (std::strcmp(key, "present_area") == 0) // STAR: GSRenderer.cpp, ShrinkForPresent
+        pcsx2gs::g_presentArea.store(*value != '0', std::memory_order_relaxed);
+    else if (std::strcmp(key, "draw_dump") == 0 && *value && pcsx2gs::g_drawDumpState.load(std::memory_order_relaxed) == 0)
+    {
+        std::lock_guard<std::mutex> lock(pcsx2gs::g_drawDumpMutex);
+        pcsx2gs::g_drawDumpRequest = value;
+        pcsx2gs::g_drawDumpState.store(1, std::memory_order_relaxed);
+    }
+}
+
+// Lines drawn over the image at each present (pcsx2gs_host.h SetOverlay): the port's hitbox overlay. Any thread.
+PCSX2GS_EXPORT void pcsx2gs_set_overlay(const float *lines, const uint32_t *colors, uint32_t count)
+{
+    pcsx2gs::SetOverlay(lines, colors, count);
+}
+
+// Labels drawn over the image at each present (pcsx2gs_host.h SetOverlayText): the port's enemy labels. Any thread.
+PCSX2GS_EXPORT void pcsx2gs_set_overlay_text(const float *xy, const uint32_t *colors, const char *texts, uint32_t count)
+{
+    pcsx2gs::SetOverlayText(xy, colors, texts, count);
+}
+
+// The port's own screen over the image (pcsx2gs_host.h SetScreen): the OPTIONS screen's text. Any thread.
+PCSX2GS_EXPORT void pcsx2gs_set_screen(const Pcsx2GsScreenItem *items, uint32_t count, const char *strings, uint32_t bytes)
+{
+    pcsx2gs::SetScreen(items, count, strings, bytes);
+}
+
+// The graphics API while the game runs ("vulkan" / "dx11"; the OPTIONS screen's Graphics API). GS thread only, between
+// vsyncs. hwnd: a new window of width x height for the GS to present into from now on (one window cannot carry both
+// kinds of swap chain; the port swaps it in for the old one after this returns). Returns 1 when the API asked for
+// runs, 2 when it already ran (nothing changed, the new window is not used), 0 when it could not start and the one
+// before runs again (in the new window), -1 when neither runs (nothing is drawn from then on).
+PCSX2GS_EXPORT int pcsx2gs_set_api(const char *api, void *hwnd, uint32_t width, uint32_t height)
+{
+    return ReopenApi(api, hwnd, width, height);
+}
+
+// The aspect ratio while the game runs (0 = 4:3, 1 = 16:9, 2 = fill the window), read at every present: the port uses
+// it to follow the game's own 4:3 / 16:9 option. Exported on its own so that the API table above stays the same.
+PCSX2GS_EXPORT void pcsx2gs_set_aspect(uint32_t mode)
+{
+    const HostFpuMode fpu;
+    ApplyAspectMode(mode);
+}
+
+// Process exit without a Close: the GS objects are left to the OS instead of being destroyed by the DLL's static
+// destructors, whose order against each other is not defined. ~GSTextureCache ran into a freed hash-cache entry that
+// way, and with only the renderer and device left alive its palettes then handed their textures back to a device
+// already gone (Oct 26: a crash on every close of the window). The port now ends with TerminateProcess, which skips
+// this detach altogether; this stays for any other way out through ExitProcess. The texture cache goes first: it is
+// the one whose destructor reaches the others.
+#ifdef _WIN32
+#include <windows.h>
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
+{
+    if (reason == DLL_PROCESS_DETACH && reserved != nullptr) // the process is exiting (not a FreeLibrary)
+    {
+        if (g_texture_cache)
+            (void)g_texture_cache.release();
+        if (g_gs_renderer)
+            (void)g_gs_renderer.release();
+        if (g_gs_device)
+            (void)g_gs_device.release();
+    }
+    return TRUE;
+}
+#endif

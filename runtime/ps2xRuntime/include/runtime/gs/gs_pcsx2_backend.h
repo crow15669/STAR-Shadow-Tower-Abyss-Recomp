@@ -1,0 +1,125 @@
+#pragma once
+
+#include "runtime/gs/gs_backend.h"
+
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+// PCSX2's GS (hardware renderer, pcsx2gs.dll) as the raster back end (docs/GS_PCSX2.md, phase 2). It takes the raw GIF
+// stream and the vsyncs, and presents into a child window over the game window on its own (no PresentationFrame).
+// Runs inside GSThreadedBackend: every call below happens on the GS thread, except the static ones.
+// The default renderer; PS2X_GS_RENDERER=nativo (config.ini [Video] Renderizador=nativo) keeps the port's GS, and
+// without the DLL the GPU back end stays.
+class GSPcsx2Backend final : public GSRasterBackend
+{
+public:
+    // Main thread: true when PS2X_GS_RENDERER asks for it and pcsx2gs.dll loads (libpcsx2gs.so on Linux, where an
+    // X11 display must also be there: the GS presents into an X11 window).
+    static bool Requested();
+    // Main thread, before the game window is made: on Linux, makes GLFW use X11 (Xwayland under a Wayland session)
+    // when the PCSX2 GS is wanted and an X11 display exists. Nothing elsewhere.
+    static void BeforeHostWindow();
+    // Main thread, after the game window exists: creates the child window the GS renders into. parentHwnd is what
+    // raylib's GetWindowHandle returns: an HWND on Windows, the GLFWwindow on Linux.
+    static void AttachHostWindow(void *parentHwnd);
+    // Main thread, once per host frame: keeps the child window over the parent's client area.
+    static void HostTick();
+    // The child window exists (the host loop then leaves the screen to it).
+    static bool Active();
+    // Any thread: the host overlays drawn over the GS image (top: message box with background rgba and fade; bottom:
+    // the FPS line). Empty = none.
+    static void SetOsd(const char *top, uint32_t topRgba, float topAlpha, const char *bottom);
+    // Any thread: the in-game menu (pcsx2gs_api.h set_menu: draw is a Pcsx2GsMenuFn, NULL hides it) and its input
+    // (a Pcsx2GsMenuInput).
+    static void SetMenu(void *draw, void *user);
+    // Any thread: an option the DLL changes while running (pcsx2gs_set_option, e.g. "dof" "0"); false = this DLL
+    // does not have it.
+    static bool SetOption(const char *key, const char *value);
+    // Any thread: a new internal resolution multiplier, handed to the DLL on the GS thread at its next present.
+    static void SetScale(float scale);
+    // Any thread: another graphics API ("vulkan" / "dx11") while running. The main thread makes a new child window (one
+    // window cannot carry both kinds of swap chain), the GS thread reopens the DLL's device and renderer into it at its
+    // next present (pcsx2gs_set_api), then the main thread swaps the windows. False = this DLL cannot do it.
+    static bool SetGraphicsApi(const char *api);
+    // Any thread: a switch asked for is still under way.
+    static bool GraphicsApiBusy();
+    // Any thread: how the last switch ended: 1 = the API asked for runs, 2 = it already ran, 0 = it could not start
+    // and the one before runs again, -1 = neither runs (nothing is drawn).
+    static int GraphicsApiResult();
+    // Any thread: lines drawn over the image at each present (pcsx2gs_set_overlay: x0 y0 x1 y1 per line in GS pixel
+    // coordinates, a colour per line with R in the low byte; count 0 clears). False = this DLL does not have it.
+    static bool SetOverlay(const float *lines, const uint32_t *colors, uint32_t count);
+    // Any thread: labels drawn over the image at each present (pcsx2gs_set_overlay_text: an x y anchor per label in
+    // the same coordinates, a colour per label, the texts packed, each ending with its 0; count 0 clears).
+    static bool SetOverlayText(const float *xy, const uint32_t *colors, const char *texts, uint32_t count);
+    // Any thread: the port's own screen over the image (pcsx2gs_set_screen: Pcsx2GsScreenItem items, their strings
+    // block; count 0 clears). False = this DLL does not have it.
+    static bool SetScreen(const void *items, uint32_t count, const char *strings, uint32_t bytes);
+    static void SetMenuInput(const void *input);
+    // Main thread: hides the GS image while a host UI drawn by raylib (the F1 debugger) is open.
+    static void SetHostUiVisible(bool visible);
+    static bool HostUiVisible();
+    // Main thread, after HostTick: the "Preparing shaders" notice to draw over the game window this frame
+    // (runtime/gs/gs_shader_notice.h: from the GS's first open until its first frame, once that has taken longer than
+    // ShaderNotice::kShowAfterSeconds; the child window is hidden meanwhile). False = none.
+    // PS2X_SHADER_NOTICE=0 turns it off, =1 on; by default it is on except on Windows (not tried there yet).
+    static bool ShaderNotice(std::string &title, std::string &detail, float &blockStart, float &blockEnd);
+    // Any thread: true once the first frame is out (or the open failed), with the time from the start of the open to
+    // it and the shaders compiled meanwhile (-1 = unknown). Logged once as "[gs] PCSX2 GS: first frame ...".
+    static bool ShaderNoticeResult(double &ms, int64_t &compiled);
+    // Any thread: fields presented so far (the F3 counter's "Screen").
+    static uint64_t Presents();
+
+    GSPcsx2Backend();
+    ~GSPcsx2Backend() override;
+
+    void Initialize(uint8_t *vram, uint32_t vramSize) override;
+    void Reset() override;
+
+    void Submit(const GSPrimitiveBatch &batch) override {}
+    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override {}
+    void BeginTransfer(const GSTransferCommand &command) override;
+    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override {}
+
+    void Flush() override {}
+    void TextureFlush() override {}
+    void Sync(GSSyncReason reason) override {}
+    PresentationFrame Present(const GSPresentationRequest &request) override { return {}; }
+
+    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override { return false; }
+    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
+
+    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override { return 0u; }
+    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override {}
+    void SnapshotVram(std::vector<uint8_t> &out) const override;
+    GSTransferSnapshot GetTransferSnapshot() const override;
+
+    // GS thread: the transfer's area as it is now, outside the GIF stream's own transfer (the async readback cache of
+    // GSThreadedBackend refreshes its entries with it). False if the GS is not open.
+    bool ReadTransfer(const GSTransferCommand &command, std::vector<uint8_t> &out);
+
+    bool WantsRawGif() const override { return true; }
+    void RawGif(const uint8_t *data, uint32_t sizeBytes) override;
+    void VSync(const GSVSyncRegs &regs) override;
+    int64_t PresentPoll() override;
+    void GsReset() override;
+
+private:
+    bool EnsureOpen();
+    void WriteFrameTime(std::chrono::steady_clock::time_point presentStart);
+
+    bool m_open = false;
+    bool m_failed = false;
+    GSTransferCommand m_download{};
+    uint32_t m_downloadLeft = 0u; // bytes of the current local -> host transfer not read yet
+    uint32_t m_width = 0u, m_height = 0u;
+    std::vector<uint8_t> m_pendingVram; // local memory to load once the GS is open
+    uint32_t m_vramSize = 4u * 1024u * 1024u;
+    uint64_t m_fields = 0u;              // vsyncs presented
+    uint64_t m_gifBytes = 0u;
+    uint64_t m_gifBytesAtPresent = 0u;
+    std::chrono::steady_clock::time_point m_lastPresent{};
+};

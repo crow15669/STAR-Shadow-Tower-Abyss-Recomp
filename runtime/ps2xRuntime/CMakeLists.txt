@@ -1,0 +1,813 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
+enable_language(C) # ipu/ps2_ipu.c (from the AC5 recompilation)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
+set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
+option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
+option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
+
+option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" ON)
+option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" ON)
+option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
+option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
+option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
+option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
+
+if(PS2X_ENABLE_SCCACHE)
+    find_program(PS2X_SCCACHE_PROGRAM sccache)
+
+    if(PS2X_SCCACHE_PROGRAM)
+        if(CMAKE_C_COMPILER)
+            set(CMAKE_C_COMPILER_LAUNCHER "${PS2X_SCCACHE_PROGRAM}")
+        endif()
+
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${PS2X_SCCACHE_PROGRAM}")
+        message(STATUS "Using sccache: ${PS2X_SCCACHE_PROGRAM}")
+    else()
+        message(STATUS "sccache not found; continuing without compiler launcher")
+    endif()
+endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ReleaseMode.cmake")
+
+set(PS2X_IS_VITA OFF)
+
+if((CMAKE_C_COMPILER MATCHES "arm-vita-eabi") OR
+    (CMAKE_CXX_COMPILER MATCHES "arm-vita-eabi"))
+    set(PS2X_IS_VITA ON)
+endif()
+
+set(PS2X_IS_ANDROID OFF)
+
+if(ANDROID)
+    set(PS2X_IS_ANDROID ON)
+endif()
+
+option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
+set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
+set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
+set(PS2X_VITA_VERSION "01.00" CACHE STRING "Vita app version")
+set(PS2X_DEFAULT_BOOT_ELF "" CACHE STRING "Guest ELF path passed directly to main() when argv is unavailable")
+
+if(PS2X_IS_VITA)
+    if(NOT DEFINED ENV{VITASDK})
+        message(FATAL_ERROR "VITASDK is not defined. Configure inside the VitaSDK environment or pass the Vita toolchain file.")
+    endif()
+
+    set(PS2X_VITASDK "$ENV{VITASDK}")
+
+    if(NOT EXISTS "${PS2X_VITASDK}/share/vita.cmake")
+        message(FATAL_ERROR "Could not find vita.cmake under ${PS2X_VITASDK}/share.")
+    endif()
+
+    include("${PS2X_VITASDK}/share/vita.cmake" REQUIRED)
+else()
+    include(FetchContent)
+    set(FETCHCONTENT_QUIET FALSE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+
+    if(PS2X_IS_ANDROID)
+        set(PLATFORM "Android" CACHE STRING "" FORCE)
+    endif()
+
+    FetchContent_Declare(
+        raylib
+        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
+        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
+        GIT_PROGRESS TRUE
+    )
+    FetchContent_MakeAvailable(raylib)
+
+    # Linux desktop: GLFW opens libGL / libEGL itself at run time (dlopen) and rlgl reaches every GL function through
+    # glad's pointers, so nothing needs libOpenGL / libGLX at link time. raylib's CMake links them anyway, which ties
+    # the executable to the build machine's GL path (a Nix store path, or a distro's libGL that a Steam Deck or a
+    # container may lack). Dropped here: the binary then loads whichever GL driver the player's system has.
+    if(UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID AND TARGET raylib)
+        get_target_property(PS2X_RAYLIB_LINKS raylib INTERFACE_LINK_LIBRARIES)
+        if(PS2X_RAYLIB_LINKS)
+            list(FILTER PS2X_RAYLIB_LINKS EXCLUDE REGEX "(^|[/:])(lib)?(OpenGL|GLX|GL)(\\.so[.0-9]*)?>?$|OpenGL::")
+            set_target_properties(raylib PROPERTIES INTERFACE_LINK_LIBRARIES "${PS2X_RAYLIB_LINKS}")
+        endif()
+        get_target_property(PS2X_RAYLIB_PRIVATE raylib LINK_LIBRARIES)
+        if(PS2X_RAYLIB_PRIVATE)
+            list(FILTER PS2X_RAYLIB_PRIVATE EXCLUDE REGEX "(^|[/:])(lib)?(OpenGL|GLX|GL)(\\.so[.0-9]*)?>?$|OpenGL::")
+            set_target_properties(raylib PROPERTIES LINK_LIBRARIES "${PS2X_RAYLIB_PRIVATE}")
+        endif()
+    endif()
+
+    # SDL3 for the controllers only (ps2_host_gamepads.cpp: PCSX2's "SDL-<n>" numbering, vibration, PlayStation
+    # controllers without Steam/DS4Windows); the window stays raylib's. Built as SDL3.dll next to the executable, which
+    # a launcher can also load to list the controllers. PS2X_SDL_INPUT=0 at run time reads GLFW's gamepads instead.
+    option(PS2X_ENABLE_SDL_INPUT "Read controllers through SDL3" ON)
+    # Linux desktop too (the Steam Deck included): libSDL3.so.0 next to GHR (its RPATH is $ORIGIN, src/CMakeLists.txt).
+    # SDL3 opens udev, hidapi's hidraw and evdev itself at run time, so nothing more is linked.
+    if(PS2X_ENABLE_SDL_INPUT AND (WIN32 OR (UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID)))
+        set(SDL_SHARED ON CACHE BOOL "" FORCE)
+        set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+        foreach(subsystem AUDIO GPU RENDER CAMERA DIALOG TRAY POWER)
+            set(SDL_${subsystem} OFF CACHE BOOL "" FORCE)
+        endforeach()
+        if(NOT WIN32)
+            # Only SDL_INIT_GAMEPAD is used (ps2_host_gamepads.cpp); the window is raylib's. Without its video
+            # subsystem SDL3 needs none of X11 / Wayland, and it keeps the joystick, gamepad, haptic, hidapi and
+            # events pieces the controllers use. Windows keeps its video subsystem as before.
+            set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+            set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+        endif()
+        FetchContent_Declare(
+            SDL3
+            URL "https://github.com/libsdl-org/SDL/releases/download/release-3.4.10/SDL3-3.4.10.tar.gz"
+            URL_HASH SHA256=12b34280415ec8418c864408b93d008a20a6530687ee613d60bfbd20411f2785
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(SDL3)
+        set_target_properties(SDL3-shared PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+        if(NOT WIN32)
+            set_target_properties(SDL3-shared PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin") # a .so is a LIBRARY output
+        endif()
+    endif()
+
+    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+        FetchContent_Declare(
+            imgui
+            GIT_REPOSITORY https://github.com/ocornut/imgui.git
+            GIT_TAG "v1.92.7-docking"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(imgui)
+
+        if(NOT imgui_POPULATED)
+            FetchContent_Populate(imgui)
+        endif()
+
+        set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
+
+        add_library(imgui STATIC
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
+        )
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
+
+        FetchContent_Declare(
+            rlImGui
+            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
+            GIT_TAG "Raylib_5_5"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(rlImGui)
+
+        if(NOT rlimgui_POPULATED)
+            FetchContent_Populate(rlImGui)
+        endif()
+
+        set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
+
+        add_library(rlImGui STATIC
+            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
+        )
+        target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
+        target_link_libraries(rlImGui PUBLIC raylib imgui)
+    endif()
+endif()
+
+add_library(ps2_host_backend INTERFACE)
+
+set(PS2X_DEFAULT_BOOT_ELF_DEFINE "")
+
+if(PS2X_DEFAULT_BOOT_ELF)
+    set(PS2X_DEFAULT_BOOT_ELF_DEFINE "${PS2X_DEFAULT_BOOT_ELF}")
+    string(REPLACE "\\" "\\\\" PS2X_DEFAULT_BOOT_ELF_DEFINE "${PS2X_DEFAULT_BOOT_ELF_DEFINE}")
+    string(REPLACE "\"" "\\\"" PS2X_DEFAULT_BOOT_ELF_DEFINE "${PS2X_DEFAULT_BOOT_ELF_DEFINE}")
+endif()
+
+if(PS2X_IS_VITA)
+    set(PS2X_VITA_PREFIX "${PS2X_VITASDK}/arm-vita-eabi")
+    set(PS2X_VITA_EXTRA_INCLUDE_DIRS "" CACHE STRING "Extra include directories for Vita host dependencies")
+    set(PS2X_VITA_LIBRARY_DIR "${PS2X_VITA_PREFIX}/lib")
+    set(PS2X_VITA_REQUIRED_LIBRARY_NAMES
+        raylib
+        SDL2
+        OpenSLES
+        taihen_stub
+        SceAppMgr_stub
+        SceCtrl_stub
+        SceGxm_stub
+        SceCommonDialog_stub
+        SceLibKernel_stub
+        SceAudio_stub
+        SceTouch_stub
+        SceHid_stub
+        SceMotion_stub
+        SceSysmodule_stub
+        SceIofilemgr_stub
+        SceNetCtl_stub
+        SceNet_stub
+        SceDisplay_stub
+        SceAppUtil_stub
+        SceAudioIn_stub
+        ScePower_stub
+        SceProcessmgr_stub
+        SceIme_stub
+        libIMGEGL_stub_weak
+        libgpu_es4_ext_stub_weak
+        libGLESv2_stub_weak
+        libGL_stub_weak
+        libGLESv1_CM_stub_weak
+    )
+
+    set(PS2X_VITA_INCLUDE_DIRS
+        "${PS2X_VITA_PREFIX}/include"
+    )
+
+    foreach(PS2X_VITA_OPTIONAL_INCLUDE_DIR IN ITEMS
+        "${PS2X_VITA_PREFIX}/include/raylib"
+        "${PS2X_VITA_PREFIX}/include/SDL2")
+        if(EXISTS "${PS2X_VITA_OPTIONAL_INCLUDE_DIR}")
+            list(APPEND PS2X_VITA_INCLUDE_DIRS "${PS2X_VITA_OPTIONAL_INCLUDE_DIR}")
+        endif()
+    endforeach()
+
+    if(PS2X_VITA_EXTRA_INCLUDE_DIRS)
+        list(APPEND PS2X_VITA_INCLUDE_DIRS ${PS2X_VITA_EXTRA_INCLUDE_DIRS})
+    endif()
+
+    if(NOT EXISTS "${PS2X_VITA_PREFIX}/include/SDL2/SDL.h")
+        message(FATAL_ERROR
+            "Missing SDL2 headers under ${PS2X_VITA_PREFIX}/include/SDL2. "
+            "Quenom/raylib-5.5-vita requires SDL2 with PVR support installed into VitaSDK.")
+    endif()
+
+    if(NOT EXISTS "${PS2X_VITA_LIBRARY_DIR}")
+        message(FATAL_ERROR "Missing Vita library directory: ${PS2X_VITA_LIBRARY_DIR}")
+    endif()
+
+    function(ps2x_find_vita_library out_var library_name)
+        string(MAKE_C_IDENTIFIER "${library_name}" library_id)
+        set(cache_var "PS2X_VITA_LIB_${library_id}")
+
+        find_library(${cache_var}
+            NAMES "${library_name}" "${library_name}.a" "lib${library_name}.a"
+            PATHS "${PS2X_VITA_LIBRARY_DIR}"
+            NO_DEFAULT_PATH
+        )
+
+        if(NOT ${cache_var})
+            message(FATAL_ERROR
+                "Could not find Vita library '${library_name}' under ${PS2X_VITA_LIBRARY_DIR}. "
+                "Install Quenom/raylib-5.5-vita and its SDL2/PVR dependencies into VitaSDK first.")
+        endif()
+
+        set(${out_var} "${${cache_var}}" PARENT_SCOPE)
+    endfunction()
+
+    set(PS2X_VITA_RESOLVED_LIBRARIES "")
+
+    foreach(PS2X_VITA_LIBRARY_NAME IN LISTS PS2X_VITA_REQUIRED_LIBRARY_NAMES)
+        ps2x_find_vita_library(PS2X_VITA_LIBRARY_PATH "${PS2X_VITA_LIBRARY_NAME}")
+        list(APPEND PS2X_VITA_RESOLVED_LIBRARIES "${PS2X_VITA_LIBRARY_PATH}")
+    endforeach()
+
+    target_compile_definitions(ps2_host_backend INTERFACE PLATFORM_VITA)
+    target_include_directories(ps2_host_backend INTERFACE ${PS2X_VITA_INCLUDE_DIRS})
+    target_link_libraries(ps2_host_backend INTERFACE
+        ${PS2X_VITA_RESOLVED_LIBRARIES}
+        m
+        c
+        pthread
+    )
+else()
+    target_link_libraries(ps2_host_backend INTERFACE raylib)
+
+    if(PS2X_IS_ANDROID)
+        target_link_libraries(ps2_host_backend INTERFACE log android)
+    endif()
+endif()
+
+if(PS2X_IS_ANDROID)
+    set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
+else()
+    set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
+endif()
+
+option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
+
+if(NOT PS2X_ENABLE_FFMPEG)
+    message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
+    add_library(ffmpeg INTERFACE)
+elseif(WIN32)
+    include(ExternalProject)
+
+    set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+    set(FFMPEG_PREBUILT_URL
+        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
+
+    set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
+    set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
+    set(FFMPEG_INCLUDE_DIR "${FFMPEG_SOURCE_DIR}/include")
+    set(FFMPEG_LIB_DIR "${FFMPEG_SOURCE_DIR}/bin")
+    set(FFMPEG_BIN_DIR "${FFMPEG_SOURCE_DIR}/bin")
+
+    ExternalProject_Add(ffmpeg_external
+        URL "${FFMPEG_PREBUILT_URL}"
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        PREFIX "${FFMPEG_PREFIX_DIR}"
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ""
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS
+        "${FFMPEG_LIB_DIR}/avcodec.lib"
+        "${FFMPEG_LIB_DIR}/avformat.lib"
+        "${FFMPEG_LIB_DIR}/avutil.lib"
+        "${FFMPEG_LIB_DIR}/swresample.lib"
+        "${FFMPEG_LIB_DIR}/swscale.lib"
+    )
+
+    # Link against the import libraries shipped with the Windows DLLs.
+    add_library(ffmpeg_avcodec STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_avcodec PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/avcodec.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_avcodec ffmpeg_external)
+
+    add_library(ffmpeg_avformat STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_avformat PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/avformat.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_avformat ffmpeg_external)
+
+    add_library(ffmpeg_avutil STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_avutil PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/avutil.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_avutil ffmpeg_external)
+
+    add_library(ffmpeg_swresample STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_swresample PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/swresample.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_swresample ffmpeg_external)
+
+    add_library(ffmpeg_swscale STATIC IMPORTED GLOBAL)
+    set_target_properties(ffmpeg_swscale PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_LIB_DIR}/swscale.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_INCLUDE_DIR}"
+    )
+    add_dependencies(ffmpeg_swscale ffmpeg_external)
+
+    add_library(ffmpeg INTERFACE)
+    target_link_libraries(ffmpeg INTERFACE
+        ffmpeg_avcodec
+        ffmpeg_avformat
+        ffmpeg_avutil
+        ffmpeg_swresample
+        ffmpeg_swscale
+        bcrypt
+        secur32
+        ws2_32
+        user32
+        advapi32
+        ole32
+        shell32
+    )
+
+    set(PS2X_FFMPEG_BIN_DIR "${FFMPEG_BIN_DIR}" CACHE INTERNAL "Directory containing FFmpeg runtime DLLs")
+    set(PS2X_COPY_FFMPEG_DLLS_SCRIPT
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CopyFfmpegDlls.cmake"
+        CACHE INTERNAL
+        "Script used to stage FFmpeg runtime DLLs beside executables")
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL
+        libavcodec
+        libavformat
+        libavutil
+        libswresample
+        libswscale
+    )
+
+    add_library(ffmpeg INTERFACE)
+    target_link_libraries(ffmpeg INTERFACE PkgConfig::FFMPEG)
+endif()
+
+function(ps2x_stage_ffmpeg_runtime_dlls target_name)
+    if(NOT WIN32)
+        return()
+    endif()
+
+    if(NOT PS2X_FFMPEG_BIN_DIR OR NOT PS2X_COPY_FFMPEG_DLLS_SCRIPT)
+        return()
+    endif()
+
+    if(TARGET ffmpeg_external)
+        add_dependencies(${target_name} ffmpeg_external)
+    endif()
+
+    add_custom_command(
+        TARGET ${target_name} POST_BUILD
+        COMMAND "${CMAKE_COMMAND}"
+        "-Dsource_dir=${PS2X_FFMPEG_BIN_DIR}"
+        "-Ddest_dir=$<TARGET_FILE_DIR:${target_name}>"
+        -P "${PS2X_COPY_FFMPEG_DLLS_SCRIPT}"
+        VERBATIM
+    )
+endfunction()
+
+add_library(ps2_runtime STATIC
+    src/lib/game_overrides.cpp
+    src/lib/gs/ps2_gif_arbiter.cpp
+    src/lib/ps2_audio.cpp
+    src/lib/ps2_audio_surround.cpp
+    src/lib/ps2_pnach.cpp
+    src/lib/ps2_game_menu.cpp
+    src/lib/ps2_hotkeys.cpp
+    src/lib/ps2_audio_vag.cpp
+    src/lib/gs/ps2_gs_memory.cpp
+    src/lib/gs/gs_frontend.cpp
+    src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_recording.cpp
+    src/lib/gs/gs_threaded_backend.cpp
+    src/lib/gs/gs_pcsx2_backend.cpp
+    src/lib/gs/gs_shader_notice_draw.cpp
+    src/lib/ipu/ps2_ipu.c
+    src/lib/ipu/ps2_ipu_glue.c
+    src/lib/gs/gs_swizzle.cpp
+    src/lib/gs/gs_cpu_raster.cpp
+    src/lib/gs/gs_band_pool.cpp
+    src/lib/gs/gpu/gs_gl.cpp
+    src/lib/gs/gpu/gs_gpu_backend.cpp
+    src/lib/gs/gpu/gs_gpu_shaders.cpp
+    src/lib/ps2_iop_host.cpp
+    src/lib/ps2_async_vif.cpp
+    src/lib/ps2_memory.cpp
+    src/lib/ps2_ee_float.cpp
+    src/lib/ps2_pad.cpp
+    src/lib/ps2_host_input.cpp
+    src/lib/ps2_host_rawmouse.cpp
+    src/lib/ps2_host_gamepads.cpp
+    src/lib/ps2_rom_device.cpp
+    src/lib/ps2_vfs.cpp
+    src/lib/ps2_cd_image.cpp
+    src/lib/ps2_runtime.cpp
+    src/lib/ps2_save_state.cpp
+    src/lib/ps2_vif1_interpreter.cpp
+    src/lib/vu/ps2_vu1_core.cpp
+    src/lib/games_database.cpp
+)
+
+if(PS2X_ENABLE_RUNTIME_LOGS)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2_RUNTIME_LOGS=1
+    )
+endif()
+
+if(PS2X_ENABLE_AGRESSIVE_LOGS)
+    target_compile_definitions(ps2_runtime PUBLIC
+        AGRESSIVE_LOGS=1
+        PS2_FUNCTION_LOG_TRACKER=1
+    )
+endif()
+
+if(PS2X_ENABLE_IOP_RPC_TRACE)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=0
+    )
+endif()
+
+if(PS2X_STRICT_RETURN_DIAGNOSTICS)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_STRICT_RETURN_DIAGNOSTICS=1
+    )
+endif()
+
+target_compile_definitions(ps2_runtime PRIVATE
+    PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
+)
+
+file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
+)
+
+target_sources(ps2_runtime PRIVATE
+    ${KERNEL_SRC_FILES}
+)
+
+file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
+)
+
+set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
+set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+
+if(EXISTS "${RUNNER_MAIN_CPP}")
+    list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
+elseif(EXISTS "${ROOT_MAIN_CPP}")
+    list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
+endif()
+
+if(PS2X_IS_ANDROID)
+    add_library(ps2EntryRunner SHARED
+        ${RUNNER_SRC_FILES}
+    )
+
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--undefined=ANativeActivity_onCreate")
+else()
+    add_executable(ps2EntryRunner
+        ${RUNNER_SRC_FILES}
+    )
+endif()
+
+if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+    set_target_properties(ps2EntryRunner PROPERTIES
+        UNITY_BUILD ON
+        UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
+    )
+endif()
+
+if(PS2X_ENABLE_RUNNER_PCH)
+    set(PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
+    )
+
+    foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
+            list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
+        endif()
+    endforeach()
+
+    list(APPEND PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_stubs.h"
+    )
+
+    target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
+endif()
+
+if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
+    target_compile_definitions(ps2EntryRunner PRIVATE
+        PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}"
+    )
+endif()
+
+if(MSVC)
+    target_compile_options(ps2EntryRunner PRIVATE /FS)
+endif()
+
+target_include_directories(ps2_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+)
+
+# FFmpeg is used only inside the runtime (Kernel/Stubs/MPEG.cpp). Linking it PRIVATE keeps its include directories
+# out of the generated game code's compile lines, so toggling PS2X_ENABLE_FFMPEG does not rebuild ~8,000 files.
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ps2_iop)
+# The Pro Logic II surround output (ps2_audio_surround.cpp) opens its own device through the miniaudio compiled into
+# raylib: only miniaudio's header is needed. Not with the Vita's prebuilt raylib (stereo only there).
+if(DEFINED raylib_SOURCE_DIR AND EXISTS "${raylib_SOURCE_DIR}/src/external/miniaudio.h")
+    target_include_directories(ps2_runtime PRIVATE "${raylib_SOURCE_DIR}/src/external")
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_MINIAUDIO=1)
+endif()
+target_link_libraries(ps2_runtime PRIVATE ffmpeg)
+
+# libchdr (BSD-3, with its own lzma / miniz / zstd): CHD disc images (ps2_cd_image.cpp). Static, no tests.
+include(FetchContent)
+set(PS2X_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+set(CHDR_WANT_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(ps2x_libchdr
+    GIT_REPOSITORY https://github.com/rtissera/libchdr.git
+    GIT_TAG 47d794151b2b64f6aba60304e6480f4f5a2bc24b) # 2026-10-11
+FetchContent_MakeAvailable(ps2x_libchdr)
+set(BUILD_SHARED_LIBS ${PS2X_SHARED_LIBS_SAVED})
+target_link_libraries(ps2_runtime PRIVATE chdr-static)
+if(TARGET SDL3::SDL3-shared)
+    target_link_libraries(ps2_runtime PRIVATE SDL3::SDL3-shared)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_SDL3=1)
+endif()
+target_link_libraries(ps2EntryRunner
+    PRIVATE
+    ps2_runtime
+)
+
+if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    target_sources(ps2EntryRunner PRIVATE
+        src/lib/ps2_debug_panel.cpp
+    )
+    target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
+    target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+endif()
+
+ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
+
+if(PS2X_IS_VITA)
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1") 
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
+
+    if(PS2X_VITA_CREATE_PACKAGE)
+        set(PS2X_VITA_VPK_FILES "")
+
+        foreach(PS2X_VITA_MODULE IN ITEMS
+            libgpu_es4_ext.suprx
+            libIMGEGL.suprx
+            libGLESv2.suprx
+            libpvrPSP2_WSEGL.suprx
+            libGL.suprx)
+            set(PS2X_VITA_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vita/module/${PS2X_VITA_MODULE}")
+
+            if(EXISTS "${PS2X_VITA_MODULE_PATH}")
+                list(APPEND PS2X_VITA_VPK_FILES FILE "${PS2X_VITA_MODULE_PATH}" "module/${PS2X_VITA_MODULE}")
+            else()
+                message(WARNING
+                    "Missing ${PS2X_VITA_MODULE_PATH}; the vpk will rely on ur0:data/external/ for it")
+            endif()
+        endforeach()
+
+        vita_create_self(eboot.bin ps2EntryRunner UNSAFE)
+        vita_create_vpk(ps2EntryRunner.vpk ${PS2X_VITA_TITLEID} eboot.bin
+            VERSION ${PS2X_VITA_VERSION}
+            NAME ${PS2X_VITA_APP_NAME}
+            ${PS2X_VITA_VPK_FILES}
+        )
+    endif()
+endif()
+
+if(WIN32)
+    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    EnableFastReleaseMode(ps2_runtime)
+    EnableFastReleaseMode(ps2EntryRunner)
+    if(MSVC)
+        set_source_files_properties(
+            src/lib/gs/gs_frontend.cpp
+            src/lib/gs/gs_cpu_backend.cpp
+            src/lib/gs/gs_cpu_raster.cpp
+            PROPERTIES COMPILE_OPTIONS "/fp:precise;/Zi")
+    endif()
+
+    if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
+        if(MSVC)
+            target_link_options(ps2EntryRunner PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>
+            )
+        elseif(MINGW)
+            target_link_options(ps2EntryRunner PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-mwindows>
+            )
+        endif()
+    endif()
+endif()
+
+# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
+if(MSVC)
+    target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+endif()
+
+# Vita: Work around for GCC 10's LTO plugin
+if(PS2X_IS_VITA)
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_vita_runtime.cpp)
+    set_source_files_properties(src/lib/ps2_vita_runtime.cpp PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
+        COMPILE_OPTIONS "-fno-lto"
+    )
+endif()
+
+if(PS2X_IS_ANDROID)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
+endif()
+
+install(TARGETS ps2_runtime ps2EntryRunner
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+if(WIN32 AND PS2X_ENABLE_FFMPEG)
+    install(DIRECTORY "${FFMPEG_BIN_DIR}/"
+        DESTINATION bin
+        FILES_MATCHING
+        PATTERN "*.dll"
+    )
+endif()
+
+install(DIRECTORY include/
+    DESTINATION include
+)
+
+# The tests (KAMITE_BUILD_TESTS=ON, ctest). The emulated vblank's lock to the host display on simulated displays, judged by the sound queue (test/vsync_lock_test.cpp:
+# issue #1, the music skipping on a variable-refresh display). A plain program with only the lock's arithmetic: no
+# window, no game code. Built by default when tests are on (this folder is EXCLUDE_FROM_ALL from the top level).
+if(KAMITE_BUILD_TESTS)
+    add_executable(vsync_lock_test test/vsync_lock_test.cpp src/lib/Kernel/vsync_lock.cpp)
+    target_include_directories(vsync_lock_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    set_target_properties(vsync_lock_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    if(MSVC)
+        target_compile_options(vsync_lock_test PRIVATE /W3 /utf-8)
+    endif()
+    add_test(NAME vsync_lock_test COMMAND vsync_lock_test)
+
+    # When the audio goes through the time-stretch, on a simulated PC below full speed (test/audio_stretch_test.cpp:
+    # issue #5, the music cutting out at 60 FPS on a slower PC). Header-only control: nothing else is linked.
+    add_executable(audio_stretch_test test/audio_stretch_test.cpp)
+    target_include_directories(audio_stretch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    set_target_properties(audio_stretch_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    if(MSVC)
+        target_compile_options(audio_stretch_test PRIVATE /W3 /utf-8)
+    endif()
+    add_test(NAME audio_stretch_test COMMAND audio_stretch_test)
+
+    # Dolby Pro Logic II decoding for surround speakers (runtime/prologic_decoder.h, issue #18): where encoded sounds
+    # land on 4.0 / 5.1 / 7.1. Header-only: nothing else is linked.
+    add_executable(prologic_decoder_test test/prologic_decoder_test.cpp)
+    target_include_directories(prologic_decoder_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    set_target_properties(prologic_decoder_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    if(MSVC)
+        target_compile_options(prologic_decoder_test PRIVATE /W3 /utf-8)
+    endif()
+    add_test(NAME prologic_decoder_test COMMAND prologic_decoder_test)
+
+    # The PCSX2 GS's "Preparing shaders" notice (runtime/gs/gs_shader_notice.h): when it shows, its text and bar, the
+    # shader count read from PCSX2's cache index files. Header-only: nothing else is linked.
+    add_executable(shader_notice_test test/shader_notice_test.cpp)
+    target_include_directories(shader_notice_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    set_target_properties(shader_notice_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    if(MSVC)
+        target_compile_options(shader_notice_test PRIVATE /W3 /utf-8)
+    endif()
+    add_test(NAME shader_notice_test COMMAND shader_notice_test)
+
+    # Keeping the display awake on Linux (runtime/keep_awake.h: issue #12, the screen blanking during play with a
+    # controller). keep_awake_test: the calls' order and fallback on a fake bus; keep_awake_bus: the real libdbus path
+    # against a private dbus-daemon with fake desktop services, and the game's own call (test/keep_awake_bus.py; skipped
+    # without dbus-daemon or python3's jeepney); keep_awake_x11: the X server's idle time reset, on Xvfb (the renderer
+    # tests' run_smoke.sh, which fails without a display or xvfb-run; skipped without libXss); keep_awake_x11_lost: the reset's X server going away doesn't end
+    # the process, another connection's still does (test/keep_awake_x11_lost.sh; skipped without Xvfb); keep_awake_wayland:
+    # the Wayland idle inhibit under a headless sway, swayidle judging (test/keep_awake_wayland.sh; skipped without
+    # sway, swaymsg or swayidle). Every skip is a
+    # failure under KAMITE_REQUIRE_ALL_TESTS=1 (the Nix check).
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+        find_package(Threads REQUIRED)
+        add_executable(keep_awake_test test/keep_awake_test.cpp src/lib/Kernel/host_keep_awake_linux.cpp)
+        target_include_directories(keep_awake_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(keep_awake_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+        set_target_properties(keep_awake_test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        add_test(NAME keep_awake_test COMMAND keep_awake_test)
+        find_package(Python3 COMPONENTS Interpreter)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME keep_awake_bus
+                COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/test/keep_awake_bus.py"
+                        "$<TARGET_FILE:keep_awake_test>")
+        else() # registered all the same: a skip, or a failure where every test must run
+            add_test(NAME keep_awake_bus COMMAND keep_awake_test missing-python)
+        endif()
+        set_tests_properties(keep_awake_bus PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        add_test(NAME keep_awake_x11
+            COMMAND "${CMAKE_SOURCE_DIR}/thirdparty/pcsx2-gs/test/run_smoke.sh" "$<TARGET_FILE:keep_awake_test>" x11)
+        # Always a fresh Xvfb (KAMITE_SMOKE_XVFB=1): on a desktop's own display a moving mouse would reset idle too.
+        set_tests_properties(keep_awake_x11 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT KAMITE_SMOKE_XVFB=1)
+        add_test(NAME keep_awake_entry_x11
+            COMMAND "${CMAKE_SOURCE_DIR}/thirdparty/pcsx2-gs/test/run_smoke.sh" "$<TARGET_FILE:keep_awake_test>" entry-x11)
+        set_tests_properties(keep_awake_entry_x11 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+            ENVIRONMENT KAMITE_SMOKE_XVFB=1) # its session bus: one of its own that never answers
+        add_test(NAME keep_awake_x11_lost
+            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/test/keep_awake_x11_lost.sh" "$<TARGET_FILE:keep_awake_test>")
+        set_tests_properties(keep_awake_x11_lost PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        # keep_awake_test_pause: the same with a 2 s pause between the Wayland surface's map and the inhibitor's
+        # roundtrip, for an output to go in (keep_awake_wayland.sh's step 6).
+        add_executable(keep_awake_test_pause test/keep_awake_test.cpp src/lib/Kernel/host_keep_awake_linux.cpp)
+        target_include_directories(keep_awake_test_pause PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_definitions(keep_awake_test_pause PRIVATE PS2X_KEEP_AWAKE_TEST_PAUSE_AFTER_MAP)
+        target_link_libraries(keep_awake_test_pause PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+        set_target_properties(keep_awake_test_pause PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        add_test(NAME keep_awake_wayland
+            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/test/keep_awake_wayland.sh" "$<TARGET_FILE:keep_awake_test>"
+                    "$<TARGET_FILE:keep_awake_test_pause>")
+        set_tests_properties(keep_awake_wayland PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+    endif()
+endif()

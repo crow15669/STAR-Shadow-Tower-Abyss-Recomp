@@ -1,0 +1,83 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+
+// The port's keyboard shortcuts (the F keys), as a table the game layer and its menus can show and rebind. Each
+// action has one binding: a raylib key with optional Shift / Ctrl. Keyboard only (Nov 14): a controller's save states
+// are the Button Mapping page's extra-button commands (ps2_host_input extra buttons), not hotkeys. The window loop asks
+// pressed() for the actions it handles itself and fire()s the others, which the game thread picks up with take(). Esc is
+// not here: it stays fixed.
+//
+// The game layer keeps the bindings (GHR.ini [Hotkeys], one line per action id); this table is the live copy.
+namespace ps2x::hotkeys
+{
+    enum class Action : int
+    {
+        Menu,        // the F2 menu
+        SaveState,   // F5
+        LoadState,   // F9
+        RecordCase,  // F1: start / stop recording a test case (kamite/test_mode.cpp); listed under the states; unbound at release
+        FpsOverlay,  // F3
+        Fullscreen,  // F11
+        HudLayout,   // F7: 16:9 / 4:3 HUD
+        ToggleTextures, // T: replacement textures (mods, texture packs) on / off, live (kamite/hd_textures.cpp)
+        ReloadTextures, // Shift+T: the replacement textures read again from their folders
+        Dump2D,      // F6: one frame's 2D to the log
+        ReloadPnach, // F4
+        RamDump,     // F8: RAM + VU1 trace
+        DebugDump,   // Shift+F8
+        GifDump,     // F10
+        DrawDump,    // Shift+F10
+        DebugPanel,  // F12
+        SlowMotion,  // Shift+F2: full speed -> 1/2 -> 1/4 -> 1/8 -> full (ps2_time_control.h)
+        Pause,       // Shift+F3: pause / resume
+        FrameStep,   // Shift+F4: one game frame on (pauses first)
+        LastPictures, // F1: the last seconds of pictures shown, written to a folder (STAR; the renderer's "ring")
+        Count
+    };
+
+    struct Binding
+    {
+        int key = 0; // raylib KEY_*, 0 = unbound
+        bool shift = false;
+        bool ctrl = false;
+        bool operator==(const Binding &o) const noexcept { return key == o.key && shift == o.shift && ctrl == o.ctrl; }
+        bool operator!=(const Binding &o) const noexcept { return !(*this == o); }
+        bool bound() const noexcept { return key != 0; }
+    };
+
+    struct Info
+    {
+        const char *id;    // the ini key ("SaveState")
+        const char *label; // for menus ("Save state")
+        Binding def;
+    };
+
+    [[nodiscard]] const Info &info(Action action);
+    [[nodiscard]] Binding binding(Action action);
+    // False for the developers' dump keys and the debugger in a player release (KAMITE_RELEASE): menus hide them.
+    [[nodiscard]] bool available(Action action);
+    void setBinding(Action action, Binding binding);
+    // Another action that already uses this binding (Count = none).
+    [[nodiscard]] Action conflict(Action action, Binding binding);
+    // The action whose binding is this key without Shift / Ctrl (Count = none): a game input put on that key does both.
+    [[nodiscard]] Action plainKeyHolder(int raylibKey);
+
+    // "Shift+F8", "F5", "" (unbound) <-> Binding. parse() takes the same text (case does not matter; "none" clears) and
+    // fails on anything else, the controller buttons older builds allowed included (the caller keeps the default).
+    [[nodiscard]] std::string text(Binding binding);
+    [[nodiscard]] bool parse(std::string_view text, Binding &out);
+    [[nodiscard]] const char *keyName(int raylibKey); // "" for a key that cannot be named
+    // The keys a hotkey may use: the F keys, letters, digits, keypad, and the named keys; not Esc.
+    [[nodiscard]] bool bindable(int raylibKey);
+    // The key pressed this frame that bindable() accepts (0 = none); for "press a key" capture. Window thread.
+    [[nodiscard]] int capturePressed();
+
+    // Window thread: the binding's key went down this frame with its modifiers (and no extra Shift/Ctrl).
+    [[nodiscard]] bool pressed(Action action);
+    // Any thread: fire() counts a press, take() returns true once per press (for actions handled off the window thread).
+    void fire(Action action);
+    [[nodiscard]] bool take(Action action);
+}

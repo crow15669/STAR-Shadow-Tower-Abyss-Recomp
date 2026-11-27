@@ -1,0 +1,219 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    cmake_minimum_required(VERSION 3.21)
+    project(pcsx2_gs_standalone LANGUAGES C CXX)
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+endif()
+
+# PCSX2's GS (hardware renderer) as libraries for the port (docs/GS_PCSX2.md). GPL-3, from github.com/PCSX2/pcsx2.
+# thirdparty/pcsx2: only the PCSX2 files this build compiles or includes (thirdparty/README.md says which commit and how
+# the list was made). Plain variables, not cache entries: an old cache pointing at a full PCSX2 clone does not win.
+set(P "${CMAKE_CURRENT_SOURCE_DIR}/../pcsx2")
+# DirectX-Headers (github.com/microsoft/DirectX-Headers, MIT): the "directx/d3d12.h" PCSX2 includes.
+set(DIRECTX_HEADERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../directx-headers")
+
+# Flags PCSX2 builds with (cmake/BuildParameters.cmake, pcsx2/CMakeLists.txt). Exceptions stay on (PCSX2 turns them
+# off; its code does not throw, and the rest of urban.exe uses them).
+add_library(pcsx2_flags INTERFACE)
+target_compile_features(pcsx2_flags INTERFACE cxx_std_20)
+if(WIN32)
+target_compile_definitions(pcsx2_flags INTERFACE
+    _M_X86=1 __SSE4_1__=1
+    WINVER=0x0A00 _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN WIL_SUPPRESS_EXCEPTIONS
+    _CRT_NONSTDC_NO_WARNINGS _CRT_SECURE_NO_WARNINGS CRT_SECURE_NO_DEPRECATE _SCL_SECURE_NO_WARNINGS
+    _UNICODE UNICODE NOMINMAX ENABLE_VULKAN
+    IMGUI_USER_CONFIG="pcsx2gs_imconfig.h")
+target_compile_options(pcsx2_flags INTERFACE
+    $<$<COMPILE_LANGUAGE:CXX>:/Zc:externConstexpr /Zc:__cplusplus /permissive- /Zc:preprocessor>
+    /utf-8 /Zo /fp:contract /GS- /W0 /bigobj /MP)
+target_include_directories(pcsx2_flags INTERFACE
+    "${P}" "${P}/pcsx2" "${CMAKE_CURRENT_SOURCE_DIR}/compat"
+    "${P}/3rdparty/fmt/include" "${P}/3rdparty/imgui/include" "${P}/3rdparty/xbyak"
+    "${P}/3rdparty/fast_float/include" "${P}/3rdparty/vulkan/include" "${P}/3rdparty/winwil/include"
+    "${P}/3rdparty/cpuinfo/include" "${P}/3rdparty/include"
+    "${DIRECTX_HEADERS_DIR}/include")
+else()
+    # Linux (GCC or Clang): Vulkan only, presenting into an X11 window (VK_KHR_xlib_surface). X11_API only turns on
+    # the Vulkan device's Xlib surface code (it uses the Xlib headers' types and calls no Xlib function), so nothing
+    # here links libX11. PCSX2GS_LIBRARY leaves out the D-Bus and Xlib parts of common/Linux/LnxMisc.cpp. Everything
+    # is compiled position independent with hidden symbols: libpcsx2gs.so exports only the C interface
+    # (compat/Bridge.cpp, PCSX2GS_EXPORT).
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(CMAKE_C_VISIBILITY_PRESET hidden)
+    set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+    find_package(Threads REQUIRED)
+    target_compile_definitions(pcsx2_flags INTERFACE
+        _M_X86=1 ENABLE_VULKAN X11_API PCSX2GS_LIBRARY
+        IMGUI_USER_CONFIG="pcsx2gs_imconfig.h")
+    # -msse4.1: PCSX2's single-ISA build at the port's floor (the top-level CMakeLists.txt says why). -w: PCSX2's
+    # warnings stay its own, as /W0 does on Windows. No strict aliasing, as PCSX2 builds on Linux.
+    target_compile_options(pcsx2_flags INTERFACE -msse4.1 -fno-strict-aliasing -w)
+    target_include_directories(pcsx2_flags INTERFACE
+        "${P}" "${P}/pcsx2" "${CMAKE_CURRENT_SOURCE_DIR}/compat"
+        "${P}/3rdparty/fmt/include" "${P}/3rdparty/imgui/include" "${P}/3rdparty/xbyak"
+        "${P}/3rdparty/fast_float/include" "${P}/3rdparty/vulkan/include"
+        "${P}/3rdparty/cpuinfo/include" "${P}/3rdparty/include")
+    target_link_libraries(pcsx2_flags INTERFACE Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
+# --- third party ---
+add_library(pcsx2_fmt STATIC "${P}/3rdparty/fmt/src/format.cc" "${P}/3rdparty/fmt/src/os.cc")
+target_link_libraries(pcsx2_fmt PRIVATE pcsx2_flags)
+
+add_library(pcsx2_imgui STATIC
+    "${P}/3rdparty/imgui/src/imgui.cpp" "${P}/3rdparty/imgui/src/imgui_draw.cpp"
+    "${P}/3rdparty/imgui/src/imgui_tables.cpp" "${P}/3rdparty/imgui/src/imgui_widgets.cpp"
+    "${P}/3rdparty/imgui/src/imgui_stdlib.cpp")
+target_link_libraries(pcsx2_imgui PRIVATE pcsx2_flags)
+
+set(CPUINFO_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(CPUINFO_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(CPUINFO_BUILD_MOCK_TESTS OFF CACHE BOOL "" FORCE)
+set(CPUINFO_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(CPUINFO_BUILD_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+set(CPUINFO_LIBRARY_TYPE static CACHE STRING "" FORCE)
+add_subdirectory("${P}/3rdparty/cpuinfo" "${CMAKE_CURRENT_BINARY_DIR}/cpuinfo" EXCLUDE_FROM_ALL)
+
+# --- common/ (PCSX2's utility library), minus what the GS does not need (emitter, HTTP, crash handler, images) ---
+set(COMMON_SOURCES
+    AlignedMalloc.cpp Assertions.cpp Console.cpp DynamicLibrary.cpp Error.cpp FileSystem.cpp HostSys.cpp
+    MemorySettingsInterface.cpp MD5Digest.cpp Perf.cpp ProgressCallback.cpp ReadbackSpinManager.cpp Semaphore.cpp
+    SettingsWrapper.cpp SmallString.cpp StringUtil.cpp TextureDecompress.cpp Timer.cpp WindowInfo.cpp)
+if(WIN32)
+    list(APPEND COMMON_SOURCES Windows/WinThreads.cpp Windows/WinHostSys.cpp Windows/WinMisc.cpp)
+else()
+    # PCSX2's Linux files (its common/CMakeLists.txt), from the same commit (thirdparty/README.md).
+    list(APPEND COMMON_SOURCES Linux/LnxThreads.cpp Linux/LnxHostSys.cpp Linux/LnxMisc.cpp)
+endif()
+list(TRANSFORM COMMON_SOURCES PREPEND "${P}/common/")
+add_library(pcsx2_common STATIC ${COMMON_SOURCES})
+target_link_libraries(pcsx2_common PRIVATE pcsx2_flags cpuinfo)
+
+# --- GS (pcsx2/CMakeLists.txt: pcsx2GSSources + pcsx2GSSourcesUnshared, single ISA, DX11 + Vulkan; no DX12) ---
+# Left out: GSDump/GSLzma (GS dumps, zstd/xz), GSCapture (FFmpeg video capture), GSPng (libpng snapshots); compat/
+# has empty versions.
+set(GS_SOURCES
+    GS/GS.cpp GS/GSClut.cpp GS/GSDrawingContext.cpp GS/GSDrawingEnvironment.cpp GS/GSLocalMemory.cpp
+    GS/GSPerfMon.cpp GS/GSRingHeap.cpp GS/GSState.cpp GS/GSTables.cpp GS/GSUtil.cpp GS/GSVector.cpp GS/MultiISA.cpp
+    GS/Renderers/Common/GSDevice.cpp GS/Renderers/Common/GSDirtyRect.cpp GS/Renderers/Common/GSFunctionMap.cpp
+    GS/Renderers/Common/GSRenderer.cpp GS/Renderers/Common/GSTexture.cpp GS/Renderers/Common/GSVertexTrace.cpp
+    GS/Renderers/Null/GSRendererNull.cpp GS/Renderers/HW/GSHwHack.cpp GS/Renderers/HW/GSRendererHW.cpp
+    GS/Renderers/HW/GSTextureCache.cpp GS/Renderers/SW/GSTextureCacheSW.cpp
+    GS/GSBlock.cpp GS/GSLocalMemoryMultiISA.cpp GS/GSXXH.cpp GS/Renderers/Common/GSVertexTraceFMM.cpp
+    GS/Renderers/HW/GSRendererHWMultiISA.cpp GS/Renderers/SW/GSDrawScanline.cpp GS/Renderers/SW/GSRasterizer.cpp
+    GS/Renderers/SW/GSRendererSW.cpp GS/Renderers/SW/GSDrawScanlineCodeGenerator.all.cpp
+    GS/Renderers/SW/GSSetupPrimCodeGenerator.all.cpp GS/Renderers/HW/GSTextureReplacements.cpp
+    GS/Renderers/Vulkan/GSDeviceVK.cpp GS/Renderers/Vulkan/GSTextureVK.cpp GS/Renderers/Vulkan/vk_mem_alloc.cpp
+    GS/Renderers/Vulkan/VKBuilders.cpp GS/Renderers/Vulkan/VKLoader.cpp GS/Renderers/Vulkan/VKShaderCache.cpp
+    GS/Renderers/Vulkan/VKStreamBuffer.cpp GS/Renderers/Vulkan/VKSwapChain.cpp)
+if(WIN32)
+    list(APPEND GS_SOURCES
+        GS/Renderers/DX11/D3D.cpp GS/Renderers/DX11/D3D11ShaderCache.cpp GS/Renderers/DX11/GSDevice11.cpp
+        GS/Renderers/DX11/GSTexture11.cpp)
+endif()
+list(TRANSFORM GS_SOURCES PREPEND "${P}/pcsx2/")
+# Texture replacement loaders: PCSX2's file with PNG through WIC (Windows) or stb_image (Linux) instead of libpng
+# (tools/make_loaders.py); .zip texture packs are left out (compat/zip.h).
+list(APPEND GS_SOURCES compat/GSTextureReplacementLoaders.cpp)
+if(WIN32)
+    # Vulkan's frames shown through a DXGI swap chain (claude/dxgi-present.md).
+    list(APPEND GS_SOURCES compat/VKDxgiPresent.cpp)
+endif()
+add_library(pcsx2_gs STATIC ${GS_SOURCES})
+target_link_libraries(pcsx2_gs PRIVATE pcsx2_flags)
+# The Vulkan device compiles its shaders with shaderc_shared.dll at run time (shaderc.cmake builds it from source).
+include("${CMAKE_CURRENT_SOURCE_DIR}/shaderc.cmake")
+target_include_directories(pcsx2_gs PRIVATE "${KAMITE_SHADERC_INCLUDE_DIR}")
+if(WIN32)
+target_link_libraries(pcsx2_gs PUBLIC pcsx2_common pcsx2_fmt pcsx2_imgui cpuinfo
+    d3d11 d3d12 dxgi d3dcompiler dxguid winmm windowscodecs ole32)
+else()
+    target_link_libraries(pcsx2_gs PUBLIC pcsx2_common pcsx2_fmt pcsx2_imgui cpuinfo)
+    # stb_image (github.com/nothings/stb v2.30, public domain / MIT): the PNG decoder of compat/PngStb.inl, where
+    # Windows has WIC. One header, downloaded at configure time with its hash checked; an offline build (a Nix
+    # sandbox) points KAMITE_STB_DIR at a folder that already has it.
+    set(KAMITE_STB_DIR "${CMAKE_CURRENT_BINARY_DIR}/stb" CACHE PATH "Folder with stb_image.h v2.30 (downloaded if missing)")
+    if(NOT EXISTS "${KAMITE_STB_DIR}/stb_image.h")
+        file(DOWNLOAD "https://raw.githubusercontent.com/nothings/stb/f58f558c120e9b32c217290b80bad1a0729fbb2c/stb_image.h"
+            "${KAMITE_STB_DIR}/stb_image.h"
+            EXPECTED_HASH SHA256=594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3)
+    endif()
+    target_include_directories(pcsx2_gs PRIVATE "${KAMITE_STB_DIR}")
+endif()
+target_include_directories(pcsx2_gs INTERFACE
+    "${P}" "${P}/pcsx2" "${CMAKE_CURRENT_SOURCE_DIR}/compat" "${P}/3rdparty/fmt/include")
+
+# --- our side: the host/VM functions the GS calls (phase 1: minimal) and the device test ---
+add_library(pcsx2gs_api INTERFACE)
+target_include_directories(pcsx2gs_api INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_library(pcsx2_gs_host STATIC compat/HostStubs.cpp compat/Pcsx2ConfigGS.cpp)
+target_link_libraries(pcsx2_gs_host PRIVATE pcsx2_flags)
+target_link_libraries(pcsx2_gs_host PUBLIC pcsx2gs_api) # the menu types (pcsx2gs_host.h)
+if(WIN32)
+target_link_libraries(pcsx2_gs PUBLIC onecore pathcch dxcompiler delayimp)
+# dxcompiler.dll (DX12's shader compiler): D3D.cpp still references it, but with no DX12 device it never loads.
+target_link_options(pcsx2_gs INTERFACE /DELAYLOAD:dxcompiler.dll)
+endif()
+
+add_executable(pcsx2_gs_test test/GSTest.cpp)
+target_link_libraries(pcsx2_gs_test PRIVATE pcsx2_flags pcsx2_gs pcsx2_gs_host)
+if(NOT WIN32)
+    # The test's own window is an X11 top-level window made with Xlib (the test links libX11; the library does not).
+    # Bridge.cpp holds the globals the port's GS changes read (draw dump, crunchy, see-through...). The GS is linked in
+    # statically here, so the executable's own search path ($ORIGIN) finds libshaderc_shared.so.1 next to it.
+    find_package(X11 REQUIRED)
+    target_sources(pcsx2_gs_test PRIVATE compat/Bridge.cpp)
+    target_link_libraries(pcsx2_gs_test PRIVATE X11::X11)
+    set_target_properties(pcsx2_gs_test PROPERTIES BUILD_RPATH "$ORIGIN")
+endif()
+
+# pcsx2gs.dll: the GS behind the C interface of include/pcsx2gs_api.h (phase 2). urban.exe loads it at run time, so
+# PCSX2's ImGui, fmt etc. stay inside the DLL. Next to it: resources/shaders (read at run time by the devices).
+add_library(pcsx2gs SHARED compat/Bridge.cpp)
+target_link_libraries(pcsx2gs PRIVATE pcsx2_flags pcsx2gs_api pcsx2_gs pcsx2_gs_host)
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set_target_properties(pcsx2gs PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    set_target_properties(shaderc_shared PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+if(NOT WIN32)
+    # One folder for the library, libshaderc_shared.so.1 and the tests (a shared library is a LIBRARY output on Linux,
+    # a RUNTIME one on Windows): next to GHR in the port's build, the build folder when built on its own.
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        set(PCSX2GS_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+    else()
+        set(PCSX2GS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
+    endif()
+    set_target_properties(pcsx2gs shaderc_shared PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${PCSX2GS_OUTPUT_DIR}")
+    set_target_properties(pcsx2_gs_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PCSX2GS_OUTPUT_DIR}")
+
+    # libpcsx2gs.so: no undefined symbol left for the loader (-z defs); only the C interface exported, also of what
+    # static archives built with default visibility bring (the portable build's libc++): compat/pcsx2gs.map, which
+    # both GNU ld and zig's lld take (zig's driver refuses --exclude-libs, which GNU ld also gets); and $ORIGIN as its
+    # search path, so libshaderc_shared.so.1 is found next to it wherever the folder is moved (dyn_shaderc dlopens it
+    # by name, and dlopen searches the RUNPATH of the library that calls it).
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "-Wl,--exclude-libs,ALL" PCSX2GS_LINKER_EXCLUDE_LIBS)
+    target_link_options(pcsx2gs PRIVATE -Wl,-z,defs "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/compat/pcsx2gs.map"
+        $<$<BOOL:${PCSX2GS_LINKER_EXCLUDE_LIBS}>:-Wl,--exclude-libs,ALL>)
+    set_property(TARGET pcsx2gs APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/compat/pcsx2gs.map")
+    # Static destructors finalized when the library is unloaded, with any toolchain (compat/dso_finalize.c says why).
+    target_sources(pcsx2gs PRIVATE compat/dso_finalize.c)
+    target_sources(shaderc_shared PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/compat/dso_finalize.c")
+    set_target_properties(pcsx2gs PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+
+    # The smoke test: libpcsx2gs.so loaded and driven through its C interface as GHR does, on an X11 window, the
+    # picture checked in the GS's image and on the window (test/SmokeTest.cpp; test/run_smoke.sh runs it headless).
+    add_executable(pcsx2_gs_smoke test/SmokeTest.cpp)
+    target_link_libraries(pcsx2_gs_smoke PRIVATE pcsx2gs_api X11::X11 ${CMAKE_DL_LIBS})
+    set_target_properties(pcsx2_gs_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PCSX2GS_OUTPUT_DIR}")
+    add_dependencies(pcsx2_gs_smoke pcsx2gs)
+endif()
+# shaderc_shared.dll next to the exe (built with the DLL; LoadLibrary finds it in the exe's folder).
+add_dependencies(pcsx2gs shaderc_shared)
+# resources/ (shaders, OSD font; see resources/README.md) next to the DLL. No shader cache is shipped: the Urban Reign
+# one came without its blob (.gitignore drops *.bin), and its orphan index, copied over a player's own cache, made PCSX2
+# read wrong bytecode from that player's blob (black screen, then a failed swap chain resize). PCSX2 builds the cache
+# (shadercache_pcsx2 next to GHR.exe) as the game runs.
+add_custom_command(TARGET pcsx2gs POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/resources" "$<TARGET_FILE_DIR:pcsx2gs>/resources")
