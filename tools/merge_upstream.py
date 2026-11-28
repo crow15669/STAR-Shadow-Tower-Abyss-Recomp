@@ -1,6 +1,10 @@
 """Three-way merge of upstream (God Hand: Rearmed) changes into STAR's copy of the shared files.
 
-    merge_upstream.py <base commit> <their commit> <path prefix or file> [...]   [--write]
+    python -I tools/merge_upstream.py <base commit> <their commit> <path prefix or file> [...]   [--write]
+
+Needs a clone of https://github.com/God-Hand-Rearmed/God-Hand-Rearmed in upstream/God-Hand-Rearmed (git ignores
+upstream/). STAR's shared files were taken at its commit c329b9c (version 0.6.9.5): that is the base until a later
+merge is noted in docs/TECHNICAL_NOTES.md.
 
 For every file under the given paths that changed upstream between the two commits: base = upstream's at <base>,
 theirs = upstream's at <their>, ours = STAR's file. Line ends are set aside for the merge and put back as STAR's file
@@ -10,7 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-STAR = Path(r"D:/VS Code projs/STA Recomp")
+STAR = Path(__file__).resolve().parent.parent
 GHR = STAR / "upstream" / "God-Hand-Rearmed"
 
 def git(*args, cwd=GHR):
