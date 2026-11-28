@@ -3,6 +3,7 @@
 #include "star/options.h"
 #include "star/bindings.h"
 #include "star/pad_map.h"
+#include "star/update.h"
 
 #include "runtime/ps2_display_options.h"
 #include "ps2_host_gamepads.h"
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -121,6 +123,10 @@ namespace star::launcher
             std::array<float, 32> padRest{}; // its axes when the taking began (a trigger may rest at one end)
             int testPad = 0;             // tests: 1 the screen opened at frame 5, 2 and every entry in turn from frame 8
             std::string testJoy;         // tests: "frame:kind:index:value,...": the test joystick's elements set at frames
+            // a newer version (star/update.h)
+            std::unique_ptr<update::Session> updates; // none: the program's folder is not known (no updates offered)
+            bool checkUpdates = true;    // the file's check_updates: look for one when the launcher opens
+            int testUpdate = 0;          // tests: 1 = the update is started by itself once a newer version is found
         };
 
         float px(const State &state, float size) { return std::round(size * state.unit); }
@@ -145,6 +151,7 @@ namespace star::launcher
             for (const options::Option &one : options::table())
                 lines.push_back({one.key, state.values[one.key]});
             lines.push_back({"preset", options::presetId(state.chosen)});
+            lines.push_back({"check_updates", state.checkUpdates ? "on" : "off"});
             for (const bindings::Action &one : bindings::actions())
             {
                 const std::vector<std::string> &inputs = state.binds[one.id];
@@ -203,6 +210,127 @@ namespace star::launcher
             ImGui::TextDisabled("Recompiled from the PS2 game");
             ImGui::PopFont();
             ImGui::EndGroup();
+        }
+
+        std::string megabytes(uint64_t bytes)
+        {
+            char text[32];
+            std::snprintf(text, sizeof(text), "%.1f", static_cast<double>(bytes) / 1048576.0);
+            return text;
+        }
+
+        // "Update" and "What's new" for a newer version found; on a failed update "Try again" and "Download page".
+        void drawUpdateButtons(State &state, const update::Session::View &now)
+        {
+            const bool failed = now.stage == update::Stage::Failed;
+            if (!now.release.url.empty())
+            {
+                ImGui::PushStyleColor(ImGuiCol_Button, kRed);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kRedHot);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, kRedDark);
+                if (ImGui::Button(failed ? "Try again" : "Update", ImVec2(px(state, 120.0f), 0.0f)))
+                    state.updates->start();
+                ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", "Downloads the new version and starts it. Your saves, save states and settings are kept.");
+                ImGui::SameLine();
+            }
+            if (ImGui::Button(failed ? "Download page" : "What's new", ImVec2(px(state, 140.0f), 0.0f)))
+                update::openPage(now.release.page);
+        }
+
+        // One line above the options' tabs, only when there is something to say: a newer version, an update under way
+        // or just done. (Not in the left column: there it pushed Play out of the window.)
+        void drawUpdateNotice(State &state)
+        {
+            if (!state.updates)
+                return;
+            using update::Stage;
+            const update::Session::View now = state.updates->view();
+            const float gap = px(state, 6.0f);
+            if (now.stage == Stage::Available)
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(kAsk, "Version %s is out.", now.release.version.c_str());
+                ImGui::SameLine(0.0f, px(state, 16.0f));
+                if (now.release.url.empty())
+                {
+                    ImGui::TextDisabled("%s", "No download for Windows yet.");
+                    ImGui::SameLine(0.0f, px(state, 16.0f));
+                }
+                drawUpdateButtons(state, now);
+            }
+            else if (now.stage == Stage::Failed)
+            {
+                textColored(kBad, ("The update did not work. " + now.note).c_str());
+                drawUpdateButtons(state, now);
+            }
+            else if (now.stage == Stage::Downloading)
+            {
+                const float part = now.total ? static_cast<float>(static_cast<double>(now.done) / static_cast<double>(now.total)) : 0.0f;
+                const std::string text = now.total ? megabytes(now.done) + " of " + megabytes(now.total) + " MB" : megabytes(now.done) + " MB";
+                const float cancel = px(state, 100.0f);
+                ImGui::AlignTextToFramePadding();
+                ImGui::Text("Downloading version %s", now.release.version.c_str());
+                ImGui::SameLine(0.0f, px(state, 16.0f));
+                ImGui::ProgressBar(part, ImVec2(std::max(ImGui::GetContentRegionAvail().x - cancel - ImGui::GetStyle().ItemSpacing.x, px(state, 80.0f)), 0.0f), text.c_str());
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(cancel, 0.0f)))
+                    state.updates->cancel();
+            }
+            else if (now.stage == Stage::Installing || now.stage == Stage::Installed)
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::Text(now.stage == Stage::Installing ? "Putting version %s in place..." : "Version %s is in place. Starting again...", now.release.version.c_str());
+            }
+            else if (!state.context->updatedFrom.empty())
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(kGood, "Updated to version %s.", state.updates->current().c_str());
+            }
+            else
+                return;
+            ImGui::Dummy(ImVec2(0.0f, gap));
+        }
+
+        // The Updates page (the options' fourth tab). What to do about a newer version is in the line above the tabs.
+        void drawUpdatesPage(State &state)
+        {
+            using update::Stage;
+            ImGui::SeparatorText("This version");
+            if (!state.updates)
+            {
+                ImGui::TextWrapped("STAR version %s", state.context->version);
+                note("Updates are not offered in this build.");
+                return;
+            }
+            const update::Session::View now = state.updates->view();
+            ImGui::TextWrapped("STAR version %s", state.updates->current().c_str());
+            switch (now.stage)
+            {
+            case Stage::Idle: note("Not looked for a newer one yet."); break;
+            case Stage::Checking: note("Looking for a newer version..."); break;
+            case Stage::UpToDate: textColored(kGood, "This is the latest version."); break;
+            case Stage::Available: textColored(kAsk, ("Version " + now.release.version + " is out: see the line above.").c_str()); break;
+            case Stage::CheckFailed: textColored(kBad, ("Could not look for a newer version. " + now.note).c_str()); break;
+            case Stage::Failed: textColored(kBad, "The update did not work: see the line above."); break;
+            default: note("Updating..."); break;
+            }
+            if (now.stage != Stage::Downloading && now.stage != Stage::Installing && now.stage != Stage::Installed)
+            {
+                ImGui::BeginDisabled(state.updates->busy());
+                if (ImGui::Button("Look now", ImVec2(px(state, 140.0f), 0.0f)))
+                    state.updates->check();
+                ImGui::EndDisabled();
+            }
+            ImGui::Dummy(ImVec2(0.0f, px(state, 6.0f)));
+            ImGui::SeparatorText("Updating");
+            if (ImGui::Checkbox("Look for a newer version when the launcher opens", &state.checkUpdates))
+                save(state, false);
+            note("This asks GitHub, where STAR is published, for the number of the latest version. Nothing else is sent.");
+            ImGui::Dummy(ImVec2(0.0f, px(state, 4.0f)));
+            ImGui::TextWrapped("%s", "An update replaces the program's own files and starts it again. Your memory cards, save states, settings, "
+                                     "controls and logs stay as they are, and your disc image is not touched.");
         }
 
         void drawDisc(State &state)
@@ -280,8 +408,11 @@ namespace star::launcher
         {
             const float tall = px(state, 48.0f), spacing = ImGui::GetStyle().ItemSpacing.x;
             const float width = ImGui::GetContentRegionAvail().x, quit = std::floor(width * 0.3f);
-            const bool ready = !state.disc.empty() && state.discProblem.empty();
-            const float lines = ImGui::GetTextLineHeightWithSpacing() * (ready ? 1.0f : 2.0f);
+            // (not while an update is being downloaded or put in place: the game would start as half of each version)
+            const update::Stage updating = state.updates ? state.updates->view().stage : update::Stage::Idle;
+            const bool busy = updating == update::Stage::Downloading || updating == update::Stage::Installing || updating == update::Stage::Installed;
+            const bool ready = !state.disc.empty() && state.discProblem.empty() && !busy;
+            const float lines = ImGui::GetTextLineHeightWithSpacing() * (ready || busy ? 1.0f : 2.0f);
             const float top = ImGui::GetCursorPosY() + ImGui::GetContentRegionAvail().y - tall - lines - ImGui::GetStyle().ItemSpacing.y;
             if (top > ImGui::GetCursorPosY())
                 ImGui::SetCursorPosY(top);
@@ -289,7 +420,7 @@ namespace star::launcher
                 ImGui::TextColored(kBad, "%s", state.saveNote.c_str());
             else
                 ImGui::TextDisabled("Saved as you go. In the game: F2.");
-            if (!ready)
+            if (!ready && !busy)
                 ImGui::TextColored(kAsk, "%s", "Play needs a disc image that passes the check.");
             ImGui::BeginDisabled(!ready);
             ImGui::PushStyleColor(ImGuiCol_Button, kRed);
@@ -1179,6 +1310,17 @@ namespace star::launcher
                     ImGui::EndChild();
                     ImGui::EndTabItem();
                 }
+            // the fourth: the program's own version and its update (star/update.h)
+            if (ImGui::BeginTabItem("Updates", nullptr, frames <= 2 && state.testPage == 3 ? ImGuiTabItemFlags_SetSelected : 0))
+            {
+                if (ImGui::BeginChild("##list", ImVec2(0.0f, std::max(height - ImGui::GetFrameHeightWithSpacing(), px(state, 80.0f))), ImGuiChildFlags_None))
+                {
+                    ImGui::Dummy(ImVec2(0.0f, px(state, 2.0f)));
+                    drawUpdatesPage(state);
+                }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
         }
 
@@ -1196,6 +1338,8 @@ namespace star::launcher
         state.binds = bindings::fromValues(fromFile);
         state.padMap = padmap::fromValues(fromFile);
         state.padLines = padmap::inValues(fromFile);
+        if (const auto check = fromFile.find("check_updates"); check != fromFile.end())
+            state.checkUpdates = !(check->second == "off" || check->second == "no" || check->second == "0" || check->second == "false");
         if (state.chosen < 0)
             state.custom = options::decodeCustom(options::encodeCustom(state.values));
         state.disc = disc;
@@ -1264,6 +1408,20 @@ namespace star::launcher
         int shotAt = 30;
         if (const char *v = std::getenv("STAR_LAUNCHER_SHOT_AT"); v && *v)
             shotAt = std::max(std::atoi(v), 12);
+        // A newer version (star/update.h): looked for once as the launcher opens, unless the settings say no. A test
+        // (STAR_LAUNCHER_SHOT) asks nobody unless it names its own server (STAR_UPDATE_API). STAR_LAUNCHER_UPDATE=1:
+        // the update is started by itself when a newer version is found (not in the program started after an update).
+        if (!context.program.empty())
+        {
+            state.updates = std::make_unique<update::Session>(context.program, context.version);
+            const char *api = std::getenv("STAR_UPDATE_API");
+            if (state.checkUpdates && (!(shot && *shot) || (api && *api)))
+                state.updates->check();
+            if (const char *v = std::getenv("STAR_LAUNCHER_UPDATE"); v && *v == '1' && context.updatedFrom.empty())
+                state.testUpdate = 1;
+            if (!context.updatedFrom.empty())
+                shotAt = std::min(shotAt, 40);
+        }
         int frame = 0;
 
         while (!state.done)
@@ -1298,6 +1456,20 @@ namespace star::launcher
             if (state.testPad == 2 && frame == 8)
                 startPadCapture(state, padmap::entries().front().id, true);
             updatePadCapture(state);
+            if (state.updates)
+            {
+                const update::Stage stage = state.updates->view().stage;
+                if (state.testUpdate == 1 && stage == update::Stage::Available)
+                {
+                    state.testUpdate = 2;
+                    state.updates->start();
+                }
+                if (stage == update::Stage::Installed)
+                {
+                    state.result = Result::Restart; // the new version is in place: main starts it
+                    state.done = true;
+                }
+            }
             BeginDrawing();
             ClearBackground(Color{18, 18, 20, 255});
             rlImGuiBegin();
@@ -1322,7 +1494,10 @@ namespace star::launcher
                 ImGui::EndChild();
                 ImGui::SameLine(0.0f, px(state, 34.0f));
                 if (ImGui::BeginChild("##options", ImVec2(0.0f, tall)))
+                {
+                    drawUpdateNotice(state);
                     drawOptions(state, ImGui::GetContentRegionAvail().y);
+                }
                 ImGui::EndChild();
             }
             ImGui::End();
@@ -1375,7 +1550,7 @@ namespace star::launcher
             EndDrawing();
         }
         rlImGuiShutdown(); // the F12 debugger sets ImGui up again later
-        std::printf("[STAR] launcher: %s\n", state.result == Result::Play ? "play" : "quit");
+        std::printf("[STAR] launcher: %s\n", state.result == Result::Play ? "play" : state.result == Result::Restart ? "updated" : "quit");
         std::fflush(stdout);
         if (state.result != Result::Play)
         {

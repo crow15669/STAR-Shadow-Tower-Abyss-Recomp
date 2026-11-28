@@ -36,6 +36,7 @@ extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void *process, u
 #include <cstdarg>
 #include "star/bindings.h"
 #include "star/pad_map.h"
+#include "star/update.h"
 #if defined(STAR_HAS_LAUNCHER)
 #include "star/launcher.h"
 #endif
@@ -163,7 +164,7 @@ namespace
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             for (char &c : value)
                 c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (name == "disc_image" || name == "custom" || name == "preset")
+            if (name == "disc_image" || name == "custom" || name == "preset" || name == "check_updates")
                 continue; // the launcher's (the disc image to show, the player's own preset, the preset chosen)
             if (name.rfind("bind_", 0) == 0)
                 continue; // the mouse and keyboard controls (star/bindings.h: read for the bindings below)
@@ -534,11 +535,14 @@ int main(int argc, char *argv[])
     fs::path iso;
     bool hidden = false;
     int seconds = 0;
+    std::string updatedFrom; // --updated <version>: started by the launcher's update (star/update.h), which was that version
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
         if (arg == "--iso" && i + 1 < argc)
             iso = argv[++i];
+        else if (arg == "--updated" && i + 1 < argc)
+            updatedFrom = argv[++i];
         else if (arg == "--hidden")
             hidden = true;
         else if (arg == "--seconds" && i + 1 < argc)
@@ -557,7 +561,13 @@ int main(int argc, char *argv[])
     }
     // STAR 2026-11-27: started the ordinary way, the program keeps its own log (logs/play_last.log next to it) and
     // works from its own folder (star/play_log.h).
+    // (after an update: the version before is still closing; its log and its files are let go first)
+    if (!updatedFrom.empty())
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
     star::startPlayLog(exeDir);
+    star::update::cleanUp(exeDir); // what an update left behind (nothing to do when there was none)
+    if (!updatedFrom.empty())
+        say("updated from version " + updatedFrom + " to " + star::kVersion);
     SetTraceLogCallback(&raylibLog);
     const fs::path cacheDir = exeDir / "cache";
     findSettingsFile(exeDir);
@@ -578,13 +588,25 @@ int main(int argc, char *argv[])
         context.title = kTitle;
         context.settingsFile = g_settingsFile;
         context.resources = exeDir / "resources";
+        context.program = exeDir;
+        context.version = star::kVersion;
+        context.updatedFrom = updatedFrom;
         context.checkDisc = [](const fs::path &image)
         {
             std::vector<uint8_t> elf;
             int code = kExitOk;
             return checkDisc(image, elf, code);
         };
-        if (star::launcher::run(context, disc) != star::launcher::Result::Play)
+        const star::launcher::Result chosen = star::launcher::run(context, disc);
+        if (chosen == star::launcher::Result::Restart)
+        {
+            // an update is in place: the new version is started, and this one ends
+            const bool started = star::update::startProgram(exeDir / "STAR.exe", std::string("--updated ") + star::kVersion);
+            say(started ? "the new version is started" : "the new version is in place but could not be started: start STAR again");
+            std::fflush(nullptr);
+            return kExitOk;
+        }
+        if (chosen != star::launcher::Result::Play)
         {
             say("quit from the launcher");
             std::fflush(nullptr);

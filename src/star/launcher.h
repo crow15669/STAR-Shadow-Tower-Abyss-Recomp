@@ -16,12 +16,18 @@ namespace star::launcher
         std::filesystem::path resources; // the folder with fonts/Roboto-Regular.ttf
         // "" when the disc image can be played, else what is wrong with it (in the player's words)
         std::function<std::string(const std::filesystem::path &)> checkDisc;
+        // the update (star/update.h): the folder the program is in ("" = no updates offered), this version, and
+        // the version before when the program has just been started by an update
+        std::filesystem::path program;
+        const char *version = "";
+        std::string updatedFrom;
     };
 
     enum class Result
     {
         Play,
         Quit,
+        Restart, // an update is in place: the caller starts the program again and ends
     };
 
     // disc: the disc image to show first (the settings file's, or STAR_ISO); on Play, the one chosen (checked, and

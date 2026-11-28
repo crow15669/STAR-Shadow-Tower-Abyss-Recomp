@@ -68,6 +68,12 @@ does in the game is still chosen in the game's own options (Control Type).
 
 Memory card saves are in the `memcards` folder and save states in `states`, both next to the program.
 
+**Updating.** When the launcher opens it asks GitHub whether a newer version is out (nothing else is sent; the
+Updates tab can switch this off). If one is, a line at the top offers **Update**: one click downloads it, puts it in
+place and starts it. Only the program's own files are replaced. Your memory cards, save states, settings and
+controls stay as they are. (Version 0.9.0 has no updater: download the newer release once by hand, unzip it into a
+new folder and copy `memcards`, `states` and `STAR settings.ini` from the old folder into it.)
+
 ## Known issues
 
 - The first start, and the first time each visual effect appears, can stall for a moment while shaders are

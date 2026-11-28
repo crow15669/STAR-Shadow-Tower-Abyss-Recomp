@@ -441,6 +441,28 @@ each preset sets. Add a setting there and both the launcher and the F2 menu can 
 setting is the STAR preset's value, so a fresh install starts on that preset. The program applies the table's
 default to any setting missing from the file (`loadSettings` in `main.cpp`).
 
+### The launcher's update (`update.cpp`, `update_win32.cpp`)
+
+- **The check:** one HTTPS GET (WinHTTP) of GitHub's `releases/latest` for the repository named in `update.h`, on a
+  thread, as the launcher opens (`check_updates = off` in the settings file, or the Updates tab, stops that). The
+  tag's numbers are compared with `star::kVersion` (`play_log.h`): **keep `kVersion` equal to the release tag**, or a
+  fresh release offers itself as an update for ever.
+- **The download:** the release asset whose name ends in `-windows-x64.zip` (so name the zip that way), only from
+  the project's own release downloads. Its size and the SHA-256 GitHub publishes for the asset are checked.
+- **Unpacking:** the zip container is read in `update.cpp` (stored and deflated entries, CRC checked, no path that
+  leaves the folder); inflate is `tinfl` from the miniz that libchdr already brings into the runtime.
+- **Putting it in place:** each file of the zip replaces the program's by renaming the old one (`<name>.star-old`)
+  and moving the new one in. Windows lets a running `.exe` and a loaded `.dll` be renamed but not overwritten, so
+  no helper program or script is needed. `STAR.exe` goes last. If any step fails every rename is undone. The
+  program then starts itself again with `--updated <old version>`; that start (and every later one that finds an
+  `update` folder) deletes the renamed files (`cleanUp`).
+- **What is never written:** `STAR settings.ini` when there is one, and anything under `memcards`, `mc0`, `mc1`,
+  `states`, `logs`, `cache`, `shadercache_pcsx2` (`playersOwn`), whatever a zip holds. The release zip holds none of
+  these in the first place (`tools/package.py`).
+- **Testing it** (`STAR_UPDATE_API`, `STAR_UPDATE_AS`, `STAR_LAUNCHER_UPDATE`): serve a `latest.json` and a zip from
+  `python -m http.server` on 127.0.0.1, copy a build into a folder with some saves in it and start it there. A
+  launcher test (`STAR_LAUNCHER_SHOT`) asks nobody unless `STAR_UPDATE_API` is set (`real` = GitHub itself).
+
 ### The Debug page
 
 `debug_menu.cpp`: give items (into the carried list), jump to any map or a saved spot, spawn creatures where the
@@ -518,6 +540,7 @@ Switches used most (environment variables; hundreds more are named in code comme
 | `PS2X_GS_RENDERER=native` + `PS2X_GS_TRACE=<tick>:<count>:<file>` | A list of every draw of a frame |
 | `PS2X_GAME_MENU_OPEN_AT=<ticks>`, `STAR_MENU_PAGE_FIRST=<page>` | Open the F2 menu by itself on a page |
 | `STAR_SETTINGS=<file>` | Another settings file, so a test never touches the player's |
+| `STAR_UPDATE_API=<url>`, `STAR_UPDATE_AS=<version>`, `STAR_LAUNCHER_UPDATE=1` | The update: ask a test server, take itself for another version, click Update by itself |
 | `STAR_LAUNCHER_SHOT=<png>` (+ `_PAGE`, `_SCROLL`, `_PRESET`, `_SET`, `_CONTROLS`, `_BIND`, `_PAD`, `_JOY`, `_SHOT_AT`) | Pictures and actions in the launcher |
 | `PS2X_TEST_JOYSTICK=<name>[\|<name>]` | A virtual controller SDL does not know (several: in that order) |
 | `STAR_JOY_TEST=<from>-<to>:<kind>:<index>:<value>,...` | Its buttons (kind 0), axes (1) and hat (2) by script, per game frame; `[joy]` lines |
@@ -555,6 +578,8 @@ lines in place and keep the comments. `tools/stage_settings.sh` stages the file 
 default, so a developer's own values never go into git; keep its list in step with the defaults in
 `src/star/options.cpp` and `src/star/bindings.cpp`, and with the entries of `src/star/pad_map.cpp` (a controller's
 set-up is staged empty).
+
+`check_updates`, `disc_image`, `preset` and `custom` are the launcher's own lines, not options of the table.
 
 Presets (Original, Remastered, STAR) are defined by the `presets` column of the options table. The launcher keeps
 the chosen one in `preset =`; any change of any setting makes it Custom.

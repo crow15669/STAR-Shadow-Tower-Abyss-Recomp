@@ -11,7 +11,7 @@ defaults=(
     text_fixes=on late_input=on analog_aim=on aim_turn_speed=100 aim_look_speed=100
     mouse_keyboard=on mouse_sensitivity=100 mouse_live_view=on mouse_invert_y=off gun_button=toggle
     melee_swings=buttons mouse_slowdown=full debug_menu=off record_pictures=off record_keep=5
-    disc_image= preset= custom=
+    disc_image= preset= custom= check_updates=on
     joy_device= joy_up= joy_down= joy_left= joy_right= joy_triangle= joy_circle= joy_cross= joy_square=
     joy_l1= joy_l2= joy_r1= joy_r2= joy_select= joy_start= joy_lstick_up= joy_lstick_right= joy_l3=
     joy_rstick_up= joy_rstick_right= joy_r3=
