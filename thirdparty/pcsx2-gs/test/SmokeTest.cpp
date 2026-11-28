@@ -288,6 +288,44 @@ int main(int argc, char *argv[])
     check(cached, "the shader cache was written to the cache folder");
 
     api->close();
+
+    // The pipeline warm-up (compat/GSWarmList.h): the pipelines this run built were learned; shipped as the list of a
+    // second open on a fresh cache, every one is built before open returns (a fresh cache waits for it), so the shader
+    // index holds every shader of the first run before any frame is drawn.
+    {
+        const auto shaders = [](const std::filesystem::path &dir) -> long long {
+            std::error_code ec;
+            const auto size = std::filesystem::file_size(dir / "vulkan_shaders.idx", ec);
+            return ec ? -1 : (static_cast<long long>(size) - 36) / 32; // header 36 bytes, entries 32 (gs_shader_notice.h)
+        };
+        const long long first = shaders(work / "cache");
+        const std::filesystem::path learned = work / "cache" / "star_warm_vulkan.bin";
+        std::error_code ec;
+        const auto learnedSize = std::filesystem::file_size(learned, ec);
+        check(!ec && learnedSize > 16u, "the pipelines built were learned (star_warm_vulkan.bin)");
+        const std::filesystem::path resources2 = work / "resources";
+        std::filesystem::copy(exeDir / "resources", resources2, std::filesystem::copy_options::recursive, ec);
+        check(!ec, "the program's resources copied for the second open");
+        std::filesystem::create_directories(resources2 / "gs_warm", ec);
+        // Over the list GHR ships (resources/gs_warm/vulkan.bin, the Steam Deck's since 20586a6): without
+        // overwrite_existing the copy fails on it, and the second open would warm the shipped list, not this run's.
+        std::filesystem::copy_file(learned, resources2 / "gs_warm" / "vulkan.bin",
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        check(!ec, "the learned list shipped as resources/gs_warm/vulkan.bin");
+        std::filesystem::create_directories(work / "cache2", ec);
+        check(!ec, "a fresh cache folder for the second open");
+        const std::string resourcesText = resources2.string(), cacheText = (work / "cache2").string();
+        params.resources = resourcesText.c_str();
+        params.cache = cacheText.c_str();
+        const bool reopened = api->open(&params) != 0;
+        check(reopened, "open again on a fresh cache, the learned list shipped");
+        const long long warmed = shaders(work / "cache2");
+        std::fprintf(stderr, "[smoke] shaders: %lld after the first run, %lld right after the warmed open\n", first, warmed);
+        check(reopened && first > 0 && warmed >= first, "the warm-up built every shader of the first run before open returned");
+        if (reopened)
+            api->close();
+    }
+
     XDestroyWindow(display, window);
     XCloseDisplay(display);
     std::filesystem::remove_all(work);

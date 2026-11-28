@@ -4,6 +4,7 @@
 #pragma once
 
 #include "GS/Renderers/Common/GSDevice.h"
+#include "GSWarmList.h" // pcsx2gs (Kamite): pipeline warm-up
 #include "GS/GSVector.h"
 #include "GS/Renderers/Vulkan/GSTextureVK.h"
 #include "GS/Renderers/Vulkan/VKLoader.h"
@@ -504,6 +505,20 @@ private:
 	VkShaderModule GetTFXFragmentShader(const GSHWDrawConfig::PSSelector& sel);
 	VkPipeline CreateTFXPipeline(const PipelineSelector& p);
 	VkPipeline GetTFXPipeline(const PipelineSelector& p);
+
+	// pcsx2gs (Kamite): the pipeline warm-up (compat/GSWarmList.h). The shader sources and the pipeline's build from
+	// given modules are split out of GetTFX*Shader / CreateTFXPipeline so the warm-up's threads build the same
+	// pipelines into the caches without touching the maps above.
+	std::string GetTFXVertexShaderSource(GSHWDrawConfig::VSSelector sel) const;
+	std::string GetTFXFragmentShaderSource(const GSHWDrawConfig::PSSelector& sel) const;
+	static GSHWDrawConfig::PSSelector TFXPipelineFragmentSelector(const PipelineSelector& p);
+	VkPipeline BuildTFXPipeline(const PipelineSelector& p, VkShaderModule vs, VkShaderModule fs) const;
+	void StartWarmup();
+	void WarmOne(const std::string& entry);
+	void FinishWarmup(bool wait);
+	GSWarm::List m_warm_list;
+	GSWarm::Pool m_warm_pool;
+	bool m_warm_flushed = true;
 
 	VkShaderModule GetUtilityVertexShader(const std::string& source, const char* replace_main);
 	VkShaderModule GetUtilityFragmentShader(const std::string& source, const char* replace_main);

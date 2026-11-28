@@ -612,11 +612,14 @@ bool GSDevice11::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 	if (!m_null_texture)
 		return false;
 
+	StartWarmup(); // pcsx2gs (Kamite)
 	return true;
 }
 
 void GSDevice11::Destroy()
 {
+	m_warm_pool.Stop(); // pcsx2gs (Kamite): the warm-up's threads use the device and the shader cache
+	m_warm_list.Close();
 	delete m_null_texture;
 	m_null_texture = nullptr;
 	
@@ -1155,6 +1158,7 @@ void GSDevice11::EndPresent()
 	const UINT sync_interval = static_cast<UINT>(m_vsync_mode == GSVSyncMode::FIFO);
 	const UINT flags = (m_vsync_mode == GSVSyncMode::Disabled && m_using_allow_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
 	m_swap_chain->Present(sync_interval, flags);
+	FinishWarmup(false); // pcsx2gs (Kamite): joins a background warm-up's threads once they are done
 
 	if (m_gpu_timing_enabled)
 		KickTimestampQuery();
@@ -1989,37 +1993,203 @@ void GSDevice11::DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float para
 	DoStretchRect(sTex, sRect, dTex, dRect, m_shadeboost.ps.get(), m_shadeboost.cb.get(), Nearest);
 }
 
+// pcsx2gs (Kamite): the shader warm-up (compat/GSWarmList.h), as GSDeviceVK's: every
+// TFX shader the GS compiles is learned; at the start the shipped list's shaders this install hasn't compiled (all of
+// them on a fresh cache, with this install's own) are compiled into the cache on worker threads, and created once so
+// the driver compiles them too. Fresh cache: Create waits for them; otherwise they run while the game plays.
+void GSDevice11::LearnShader(u32 kind, const void* selector, size_t size)
+{
+	WarmEntry entry{};
+	entry.kind = kind;
+	std::memcpy(entry.data, selector, std::min(size, sizeof(entry.data)));
+	m_warm_list.Learn(&entry);
+}
+
+void GSDevice11::StartWarmup()
+{
+	u64 tag = GSWarm::Hash(&m_features, sizeof(m_features));
+	const u32 level = static_cast<u32>(m_feature_level) | (m_conservative_depth ? 0x80000000u : 0u);
+	tag = GSWarm::Hash(&level, sizeof(level), tag);
+	m_warm_list.Open(2, sizeof(WarmEntry), tag, Path::Combine(EmuFolders::Resources, "gs_warm/dx11.bin"),
+		Path::Combine(EmuFolders::Cache, "star_warm_dx11.bin"));
+	if (GSConfig.DisableShaderCache)
+		return;
+	const bool fresh = m_shader_cache.IsFresh();
+	std::vector<std::string> work = m_warm_list.Missing(fresh ? m_warm_list.Forget() : std::vector<std::string>{});
+	if (work.empty() || !GSWarm::Enabled())
+	{
+		Console.WriteLn("Shader warm-up: %s (GPU tag %016llX)", work.empty() ? "nothing to compile" : "off (PS2X_GS_WARMUP=0)",
+			static_cast<unsigned long long>(tag));
+		return;
+	}
+	const bool background = !fresh;
+	const unsigned threads = GSWarm::Threads(background);
+	Console.WriteLn("Shader warm-up: %zu shaders on %u thread(s), %s (GPU tag %016llX)", work.size(), threads,
+		background ? "in the background" : "the game waits", static_cast<unsigned long long>(tag));
+	m_warm_done = false;
+	m_warm_pool.Start(std::move(work), threads, background, [this](const std::string& entry) { WarmOne(entry); });
+	if (!background)
+		FinishWarmup(true);
+}
+
+void GSDevice11::WarmOne(const std::string& entry)
+{
+	WarmEntry e;
+	std::memcpy(&e, entry.data(), sizeof(e));
+	if (e.kind == 0)
+	{
+		VSSelector sel;
+		std::memcpy(&sel.key, e.data, sizeof(sel.key));
+		ShaderMacro sm = TFXVertexMacros(sel);
+		const bool expand = sel.expand != GSHWDrawConfig::VSExpand::None;
+		wil::com_ptr_nothrow<ID3DBlob> blob = m_shader_cache.GetShaderBlob(D3D::ShaderType::Vertex, m_tfx_source,
+			sm.GetPtr(), expand ? "vs_main_expand" : "vs_main");
+		wil::com_ptr_nothrow<ID3D11VertexShader> shader;
+		if (!blob || FAILED(m_dev->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, shader.put())))
+			return;
+	}
+	else if (e.kind == 1)
+	{
+		PSSelector sel;
+		std::memcpy(&sel, e.data, sizeof(sel));
+		ShaderMacro sm = TFXPixelMacros(sel);
+		wil::com_ptr_nothrow<ID3DBlob> blob =
+			m_shader_cache.GetShaderBlob(D3D::ShaderType::Pixel, m_tfx_source, sm.GetPtr(), "ps_main");
+		wil::com_ptr_nothrow<ID3D11PixelShader> shader;
+		if (!blob || FAILED(m_dev->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, shader.put())))
+			return;
+	}
+	else
+	{
+		return;
+	}
+	m_warm_list.Learn(&e);
+}
+
+void GSDevice11::FinishWarmup(bool wait)
+{
+	if (m_warm_done || (!wait && m_warm_pool.Running()))
+		return;
+	m_warm_pool.Wait();
+	m_warm_done = true;
+	Console.WriteLn("Shader warm-up: done (%zu of %zu)", m_warm_pool.Done(), m_warm_pool.Total());
+}
+
+// The TFX vertex layout (SetupVS, the warm-up).
+static constexpr const D3D11_INPUT_ELEMENT_DESC s_tfx_vertex_layout[] =
+	{
+		{"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+		{"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+		{"TEXCOORD", 1, DXGI_FORMAT_R32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+		{"POSITION", 0, DXGI_FORMAT_R16G16_UINT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+		{"POSITION", 1, DXGI_FORMAT_R32_UINT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0},
+		{"TEXCOORD", 2, DXGI_FORMAT_R16G16_UINT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+		{"COLOR", 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
+	};
+
+// pcsx2gs (Kamite): SetupVS's macros (also the warm-up's; const: reads only).
+GSDevice11::ShaderMacro GSDevice11::TFXVertexMacros(VSSelector sel) const
+{
+	ShaderMacro sm;
+
+	sm.AddMacro("VERTEX_SHADER", 1);
+	sm.AddMacro("VS_TME", sel.tme);
+	sm.AddMacro("VS_FST", sel.fst);
+	sm.AddMacro("VS_IIP", sel.iip);
+	sm.AddMacro("VS_PERSP_COLOR", sel.persp_color); // pcsx2gs (Kamite)
+	sm.AddMacro("VS_EXPAND", static_cast<int>(sel.expand));
+	return sm;
+}
+
+// pcsx2gs (Kamite): SetupPS's macros (also the warm-up's; const: reads only).
+GSDevice11::ShaderMacro GSDevice11::TFXPixelMacros(const PSSelector& sel) const
+{
+	ShaderMacro sm;
+
+	sm.AddMacro("PIXEL_SHADER", 1);
+	sm.AddMacro("PS_HAS_CONSERVATIVE_DEPTH", m_conservative_depth);
+	sm.AddMacro("PS_DEPTH_FEEDBACK_SUPPORT", m_features.depth_feedback ? 1 : 2);
+	sm.AddMacro("PS_FST", sel.fst);
+	sm.AddMacro("PS_WMS", sel.wms);
+	sm.AddMacro("PS_WMT", sel.wmt);
+	sm.AddMacro("PS_ADJS", sel.adjs);
+	sm.AddMacro("PS_ADJT", sel.adjt);
+	sm.AddMacro("PS_AEM_FMT", sel.aem_fmt);
+	sm.AddMacro("PS_AEM", sel.aem);
+	sm.AddMacro("PS_TFX", sel.tfx);
+	sm.AddMacro("PS_TCC", sel.tcc);
+	sm.AddMacro("PS_DATE", sel.date);
+	sm.AddMacro("PS_ATST", static_cast<u32>(sel.atst));
+	sm.AddMacro("PS_AFAIL", static_cast<u32>(sel.afail));
+	sm.AddMacro("PS_FOG", sel.fog);
+	sm.AddMacro("PS_IIP", sel.iip);
+	sm.AddMacro("PS_BLEND_HW", sel.blend_hw);
+	sm.AddMacro("PS_A_MASKED", sel.a_masked);
+	sm.AddMacro("PS_FBA", sel.fba);
+	sm.AddMacro("PS_FBMASK", sel.fbmask);
+	sm.AddMacro("PS_LTF", sel.ltf);
+	sm.AddMacro("PS_TCOFFSETHACK", sel.tcoffsethack);
+	sm.AddMacro("PS_POINT_SAMPLER", sel.point_sampler);
+	sm.AddMacro("PS_REGION_RECT", sel.region_rect);
+	sm.AddMacro("PS_SHUFFLE", sel.shuffle);
+	sm.AddMacro("PS_SHUFFLE_SAME", sel.shuffle_same);
+	sm.AddMacro("PS_PROCESS_BA", sel.process_ba);
+	sm.AddMacro("PS_PROCESS_RG", sel.process_rg);
+	sm.AddMacro("PS_SHUFFLE_ACROSS", sel.shuffle_across);
+	sm.AddMacro("PS_READ16_SRC", sel.real16src);
+	sm.AddMacro("PS_WRITE_RG", sel.write_rg);
+	sm.AddMacro("PS_CHANNEL_FETCH", sel.channel);
+	sm.AddMacro("PS_TALES_OF_ABYSS_HLE", sel.tales_of_abyss_hle);
+	sm.AddMacro("PS_URBAN_CHAOS_HLE", sel.urban_chaos_hle);
+	sm.AddMacro("PS_DST_FMT", sel.dst_fmt);
+	sm.AddMacro("PS_DEPTH_FMT", sel.depth_fmt);
+	sm.AddMacro("PS_PAL_FMT", sel.pal_fmt);
+	sm.AddMacro("PS_COLCLIP_HW", sel.colclip_hw);
+	sm.AddMacro("PS_RTA_CORRECTION", sel.rta_correction);
+	sm.AddMacro("PS_RTA_SRC_CORRECTION", sel.rta_source_correction);
+	sm.AddMacro("PS_COLCLIP", sel.colclip);
+	sm.AddMacro("PS_BLEND_A", sel.blend_a);
+	sm.AddMacro("PS_BLEND_B", sel.blend_b);
+	sm.AddMacro("PS_BLEND_C", sel.blend_c);
+	sm.AddMacro("PS_BLEND_D", sel.blend_d);
+	sm.AddMacro("PS_BLEND_MIX", sel.blend_mix);
+	sm.AddMacro("PS_ROUND_INV", sel.round_inv);
+	sm.AddMacro("PS_FIXED_ONE_A", sel.fixed_one_a);
+	sm.AddMacro("PS_PABE", sel.pabe);
+	sm.AddMacro("PS_DITHER", sel.dither);
+	sm.AddMacro("PS_DITHER_ADJUST", sel.dither_adjust);
+	sm.AddMacro("PS_ZCLAMP", sel.zclamp);
+	sm.AddMacro("PS_ZFLOOR", sel.zfloor);
+	sm.AddMacro("PS_SCANMSK", sel.scanmsk);
+	sm.AddMacro("PS_AUTOMATIC_LOD", sel.automatic_lod);
+	sm.AddMacro("PS_MANUAL_LOD", sel.manual_lod);
+	sm.AddMacro("PS_TEX_IS_FB", sel.tex_is_fb);
+	sm.AddMacro("PS_NO_COLOR", sel.no_color);
+	sm.AddMacro("PS_NO_COLOR1", sel.no_color1);
+	sm.AddMacro("PS_ZTST", sel.ztst);
+	sm.AddMacro("PS_AA1", static_cast<u32>(sel.aa1));
+	sm.AddMacro("PS_ABE", sel.abe);
+	sm.AddMacro("PS_ANISOTROPIC_FILTERING", sel.sw_aniso);
+	sm.AddMacro("PS_ROV_COLOR", sel.rov_color);
+	sm.AddMacro("PS_ROV_DEPTH", static_cast<u32>(sel.rov_depth));
+	sm.AddMacro("PS_SEE_THROUGH", sel.see_through); // pcsx2gs (Kamite)
+	sm.AddMacro("PS_PERSP_COLOR", sel.persp_color); // pcsx2gs (Kamite)
+	return sm;
+}
+
 void GSDevice11::SetupVS(VSSelector sel, const GSHWDrawConfig::VSConstantBuffer* cb)
 {
 	auto i = std::as_const(m_vs).find(sel.key);
 
 	if (i == m_vs.end())
 	{
-		ShaderMacro sm;
-
-		sm.AddMacro("VERTEX_SHADER", 1);
-		sm.AddMacro("VS_TME", sel.tme);
-		sm.AddMacro("VS_FST", sel.fst);
-		sm.AddMacro("VS_IIP", sel.iip);
-		sm.AddMacro("VS_PERSP_COLOR", sel.persp_color); // pcsx2gs (Kamite)
-		sm.AddMacro("VS_EXPAND", static_cast<int>(sel.expand));
-
-		static constexpr const D3D11_INPUT_ELEMENT_DESC layout[] =
-			{
-				{"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-				{"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
-				{"TEXCOORD", 1, DXGI_FORMAT_R32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
-				{"POSITION", 0, DXGI_FORMAT_R16G16_UINT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
-				{"POSITION", 1, DXGI_FORMAT_R32_UINT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0},
-				{"TEXCOORD", 2, DXGI_FORMAT_R16G16_UINT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
-				{"COLOR", 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
-			};
+		ShaderMacro sm = TFXVertexMacros(sel); // pcsx2gs (Kamite): split out for the warm-up
 
 		GSVertexShader11 vs;
 		if (sel.expand == GSHWDrawConfig::VSExpand::None)
 		{
-			m_shader_cache.GetVertexShaderAndInputLayout(m_dev.get(), vs.vs.put(), vs.il.put(), layout,
-				std::size(layout), m_tfx_source, sm.GetPtr(), "vs_main");
+			m_shader_cache.GetVertexShaderAndInputLayout(m_dev.get(), vs.vs.put(), vs.il.put(), s_tfx_vertex_layout,
+				std::size(s_tfx_vertex_layout), m_tfx_source, sm.GetPtr(), "vs_main");
 		}
 		else
 		{
@@ -2027,6 +2197,7 @@ void GSDevice11::SetupVS(VSSelector sel, const GSHWDrawConfig::VSConstantBuffer*
 		}
 
 		i = m_vs.try_emplace(sel.key, std::move(vs)).first;
+		LearnShader(0, &sel.key, sizeof(sel.key)); // pcsx2gs (Kamite)
 	}
 
 	if (m_vs_cb_cache.Update(*cb))
@@ -2045,79 +2216,11 @@ void GSDevice11::SetupPS(const PSSelector& sel, const GSHWDrawConfig::PSConstant
 
 	if (i == m_ps.end())
 	{
-		ShaderMacro sm;
-
-		sm.AddMacro("PIXEL_SHADER", 1);
-		sm.AddMacro("PS_HAS_CONSERVATIVE_DEPTH", m_conservative_depth);
-		sm.AddMacro("PS_DEPTH_FEEDBACK_SUPPORT", m_features.depth_feedback ? 1 : 2);
-		sm.AddMacro("PS_FST", sel.fst);
-		sm.AddMacro("PS_WMS", sel.wms);
-		sm.AddMacro("PS_WMT", sel.wmt);
-		sm.AddMacro("PS_ADJS", sel.adjs);
-		sm.AddMacro("PS_ADJT", sel.adjt);
-		sm.AddMacro("PS_AEM_FMT", sel.aem_fmt);
-		sm.AddMacro("PS_AEM", sel.aem);
-		sm.AddMacro("PS_TFX", sel.tfx);
-		sm.AddMacro("PS_TCC", sel.tcc);
-		sm.AddMacro("PS_DATE", sel.date);
-		sm.AddMacro("PS_ATST", static_cast<u32>(sel.atst));
-		sm.AddMacro("PS_AFAIL", static_cast<u32>(sel.afail));
-		sm.AddMacro("PS_FOG", sel.fog);
-		sm.AddMacro("PS_IIP", sel.iip);
-		sm.AddMacro("PS_BLEND_HW", sel.blend_hw);
-		sm.AddMacro("PS_A_MASKED", sel.a_masked);
-		sm.AddMacro("PS_FBA", sel.fba);
-		sm.AddMacro("PS_FBMASK", sel.fbmask);
-		sm.AddMacro("PS_LTF", sel.ltf);
-		sm.AddMacro("PS_TCOFFSETHACK", sel.tcoffsethack);
-		sm.AddMacro("PS_POINT_SAMPLER", sel.point_sampler);
-		sm.AddMacro("PS_REGION_RECT", sel.region_rect);
-		sm.AddMacro("PS_SHUFFLE", sel.shuffle);
-		sm.AddMacro("PS_SHUFFLE_SAME", sel.shuffle_same);
-		sm.AddMacro("PS_PROCESS_BA", sel.process_ba);
-		sm.AddMacro("PS_PROCESS_RG", sel.process_rg);
-		sm.AddMacro("PS_SHUFFLE_ACROSS", sel.shuffle_across);
-		sm.AddMacro("PS_READ16_SRC", sel.real16src);
-		sm.AddMacro("PS_WRITE_RG", sel.write_rg);
-		sm.AddMacro("PS_CHANNEL_FETCH", sel.channel);
-		sm.AddMacro("PS_TALES_OF_ABYSS_HLE", sel.tales_of_abyss_hle);
-		sm.AddMacro("PS_URBAN_CHAOS_HLE", sel.urban_chaos_hle);
-		sm.AddMacro("PS_DST_FMT", sel.dst_fmt);
-		sm.AddMacro("PS_DEPTH_FMT", sel.depth_fmt);
-		sm.AddMacro("PS_PAL_FMT", sel.pal_fmt);
-		sm.AddMacro("PS_COLCLIP_HW", sel.colclip_hw);
-		sm.AddMacro("PS_RTA_CORRECTION", sel.rta_correction);
-		sm.AddMacro("PS_RTA_SRC_CORRECTION", sel.rta_source_correction);
-		sm.AddMacro("PS_COLCLIP", sel.colclip);
-		sm.AddMacro("PS_BLEND_A", sel.blend_a);
-		sm.AddMacro("PS_BLEND_B", sel.blend_b);
-		sm.AddMacro("PS_BLEND_C", sel.blend_c);
-		sm.AddMacro("PS_BLEND_D", sel.blend_d);
-		sm.AddMacro("PS_BLEND_MIX", sel.blend_mix);
-		sm.AddMacro("PS_ROUND_INV", sel.round_inv);
-		sm.AddMacro("PS_FIXED_ONE_A", sel.fixed_one_a);
-		sm.AddMacro("PS_PABE", sel.pabe);
-		sm.AddMacro("PS_DITHER", sel.dither);
-		sm.AddMacro("PS_DITHER_ADJUST", sel.dither_adjust);
-		sm.AddMacro("PS_ZCLAMP", sel.zclamp);
-		sm.AddMacro("PS_ZFLOOR", sel.zfloor);
-		sm.AddMacro("PS_SCANMSK", sel.scanmsk);
-		sm.AddMacro("PS_AUTOMATIC_LOD", sel.automatic_lod);
-		sm.AddMacro("PS_MANUAL_LOD", sel.manual_lod);
-		sm.AddMacro("PS_TEX_IS_FB", sel.tex_is_fb);
-		sm.AddMacro("PS_NO_COLOR", sel.no_color);
-		sm.AddMacro("PS_NO_COLOR1", sel.no_color1);
-		sm.AddMacro("PS_ZTST", sel.ztst);
-		sm.AddMacro("PS_AA1", static_cast<u32>(sel.aa1));
-		sm.AddMacro("PS_ABE", sel.abe);
-		sm.AddMacro("PS_ANISOTROPIC_FILTERING", sel.sw_aniso);
-		sm.AddMacro("PS_ROV_COLOR", sel.rov_color);
-		sm.AddMacro("PS_ROV_DEPTH", static_cast<u32>(sel.rov_depth));
-		sm.AddMacro("PS_SEE_THROUGH", sel.see_through); // pcsx2gs (Kamite)
-		sm.AddMacro("PS_PERSP_COLOR", sel.persp_color); // pcsx2gs (Kamite)
+		ShaderMacro sm = TFXPixelMacros(sel); // pcsx2gs (Kamite): split out for the warm-up
 
 		wil::com_ptr_nothrow<ID3D11PixelShader> ps = m_shader_cache.GetPixelShader(m_dev.get(), m_tfx_source, sm.GetPtr(), "ps_main");
 		i = m_ps.try_emplace(sel, std::move(ps)).first;
+		LearnShader(1, &sel, sizeof(sel)); // pcsx2gs (Kamite)
 	}
 
 	if (cb && m_ps_cb_cache.Update(*cb))

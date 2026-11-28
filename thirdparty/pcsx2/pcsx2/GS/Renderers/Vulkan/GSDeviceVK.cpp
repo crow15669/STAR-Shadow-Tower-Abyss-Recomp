@@ -2318,12 +2318,16 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
 		return false;
 
 	InitializeState();
+	StartWarmup(); // pcsx2gs (Kamite)
 	return true;
 }
 
 void GSDeviceVK::Destroy()
 {
 	std::unique_lock lock(s_instance_mutex);
+
+	m_warm_pool.Stop(); // pcsx2gs (Kamite): the warm-up's threads use the device and the shader cache
+	m_warm_list.Close();
 
 	GSDevice::Destroy();
 
@@ -2605,6 +2609,7 @@ void GSDeviceVK::EndPresent()
 	MoveToNextCommandBuffer();
 
 	InvalidateCachedState();
+	FinishWarmup(false); // pcsx2gs (Kamite): a background warm-up's end saves the pipeline cache
 }
 
 bool GSDeviceVK::IsPresenting() const
@@ -5044,6 +5049,17 @@ VkShaderModule GSDeviceVK::GetTFXVertexShader(GSHWDrawConfig::VSSelector sel)
 	if (it != m_tfx_vertex_shaders.end())
 		return it->second;
 
+	VkShaderModule mod = g_vulkan_shader_cache->GetVertexShader(GetTFXVertexShaderSource(sel));
+	if (mod)
+		Vulkan::SetObjectName(m_device, mod, "TFX Vertex %08X", sel.key);
+
+	m_tfx_vertex_shaders.emplace(sel.key, mod);
+	return mod;
+}
+
+// pcsx2gs (Kamite): split out of GetTFXVertexShader for the warm-up's threads (const: reads only).
+std::string GSDeviceVK::GetTFXVertexShaderSource(GSHWDrawConfig::VSSelector sel) const
+{
 	std::stringstream ss;
 	AddShaderHeader(ss);
 	AddShaderStageMacro(ss, true, false, false);
@@ -5055,13 +5071,7 @@ VkShaderModule GSDeviceVK::GetTFXVertexShader(GSHWDrawConfig::VSSelector sel)
 	AddMacro(ss, "VS_PROVOKING_VERTEX_LAST", static_cast<int>(m_features.provoking_vertex_last));
 	AddMacro(ss, "VS_PERSP_COLOR", sel.persp_color); // pcsx2gs (Kamite)
 	ss << m_tfx_source;
-
-	VkShaderModule mod = g_vulkan_shader_cache->GetVertexShader(ss.str());
-	if (mod)
-		Vulkan::SetObjectName(m_device, mod, "TFX Vertex %08X", sel.key);
-
-	m_tfx_vertex_shaders.emplace(sel.key, mod);
-	return mod;
+	return ss.str();
 }
 
 VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector& sel)
@@ -5070,6 +5080,17 @@ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector
 	if (it != m_tfx_fragment_shaders.end())
 		return it->second;
 
+	VkShaderModule mod = g_vulkan_shader_cache->GetFragmentShader(GetTFXFragmentShaderSource(sel));
+	if (mod)
+		Vulkan::SetObjectName(m_device, mod, "TFX Fragment %016" PRIX64 "_%016" PRIX64, sel.key_hi, sel.key_lo);
+
+	m_tfx_fragment_shaders.emplace(sel, mod);
+	return mod;
+}
+
+// pcsx2gs (Kamite): split out of GetTFXFragmentShader for the warm-up's threads (const: reads only).
+std::string GSDeviceVK::GetTFXFragmentShaderSource(const GSHWDrawConfig::PSSelector& sel) const
+{
 	std::stringstream ss;
 	AddShaderHeader(ss);
 	AddShaderStageMacro(ss, false, false, true);
@@ -5141,16 +5162,30 @@ VkShaderModule GSDeviceVK::GetTFXFragmentShader(const GSHWDrawConfig::PSSelector
 	AddMacro(ss, "PS_OWNER_TEST", sel.owner_test); // pcsx2gs (STAR)
 	AddMacro(ss, "PS_OWNER_WALLS", sel.owner_walls); // pcsx2gs (STAR)
 	ss << m_tfx_source;
+	return ss.str();
+}
 
-	VkShaderModule mod = g_vulkan_shader_cache->GetFragmentShader(ss.str());
-	if (mod)
-		Vulkan::SetObjectName(m_device, mod, "TFX Fragment %016" PRIX64 "_%016" PRIX64, sel.key_hi, sel.key_lo);
-
-	m_tfx_fragment_shaders.emplace(sel, mod);
-	return mod;
+// pcsx2gs (Kamite): the fragment selector a pipeline uses (blending off when the colours are masked).
+GSHWDrawConfig::PSSelector GSDeviceVK::TFXPipelineFragmentSelector(const PipelineSelector& p)
+{
+	GSHWDrawConfig::PSSelector pps{p.ps};
+	if (!p.bs.IsEffective(p.cms))
+		pps.no_color1 = true;
+	return pps;
 }
 
 VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
+{
+	VkShaderModule vs = GetTFXVertexShader(p.vs);
+	VkShaderModule fs = GetTFXFragmentShader(TFXPipelineFragmentSelector(p));
+	if (vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE)
+		return VK_NULL_HANDLE;
+	return BuildTFXPipeline(p, vs, fs);
+}
+
+// pcsx2gs (Kamite): CreateTFXPipeline's build from given shader modules; const, so the warm-up's threads use it too
+// (the render passes are made at the device's start; the pipeline cache is internally synchronized).
+VkPipeline GSDeviceVK::BuildTFXPipeline(const PipelineSelector& p, VkShaderModule vs, VkShaderModule fs) const
 {
 	static constexpr std::array<VkPrimitiveTopology, 3> topology_lookup = {{
 		VK_PRIMITIVE_TOPOLOGY_POINT_LIST, // Point
@@ -5159,18 +5194,11 @@ VkPipeline GSDeviceVK::CreateTFXPipeline(const PipelineSelector& p)
 	}};
 
 	GSHWDrawConfig::BlendState pbs{p.bs};
-	GSHWDrawConfig::PSSelector pps{p.ps};
 	if (!p.bs.IsEffective(p.cms))
 	{
-		// disable blending when colours are masked
+		// disable blending when colours are masked (the fragment selector: TFXPipelineFragmentSelector)
 		pbs = {};
-		pps.no_color1 = true;
 	}
-
-	VkShaderModule vs = GetTFXVertexShader(p.vs);
-	VkShaderModule fs = GetTFXFragmentShader(pps);
-	if (vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE)
-		return VK_NULL_HANDLE;
 
 	Vulkan::GraphicsPipelineBuilder gpb;
 	SetPipelineProvokingVertex(m_features, gpb);
@@ -5293,7 +5321,82 @@ VkPipeline GSDeviceVK::GetTFXPipeline(const PipelineSelector& p)
 
 	VkPipeline pipeline = CreateTFXPipeline(p);
 	m_tfx_pipelines.emplace(p, pipeline);
+	if (pipeline != VK_NULL_HANDLE)
+		m_warm_list.Learn(&p); // pcsx2gs (Kamite): now in the caches
 	return pipeline;
+}
+
+// pcsx2gs (Kamite): the pipeline warm-up (compat/GSWarmList.h). At the device's start:
+// on a fresh cache (no cache yet, another GPU or driver) every pipeline of the shipped list and of this install's own
+// list is built on all cores but one while the device's creation waits (the "Preparing shaders" notice counts the
+// shaders); otherwise only shipped pipelines this install hasn't built yet, on one or two low-priority threads while
+// the game runs. Each is built into the shader and pipeline caches and thrown away: the game's own first use then
+// comes from the caches, as on a second run. PS2X_GS_WARMUP=0: off.
+void GSDeviceVK::StartWarmup()
+{
+	// The GPU's tag: the features the selectors depend on.
+	u64 tag = GSWarm::Hash(&m_features, sizeof(m_features));
+	const u32 extensions = (m_optional_extensions.vk_ext_rasterization_order_attachment_access ? 1u : 0u) |
+	                       (m_optional_extensions.vk_ext_line_rasterization ? 2u : 0u) |
+	                       (m_optional_extensions.vk_ext_attachment_feedback_loop_layout ? 4u : 0u) |
+	                       (m_optional_extensions.vk_ext_fragment_shader_interlock ? 8u : 0u) |
+	                       (m_optional_extensions.vk_ext_provoking_vertex ? 16u : 0u) | (UseFeedbackLoopLayout() ? 32u : 0u);
+	tag = GSWarm::Hash(&extensions, sizeof(extensions), tag);
+	m_warm_list.Open(1, sizeof(PipelineSelector), tag, Path::Combine(EmuFolders::Resources, "gs_warm/vulkan.bin"),
+		Path::Combine(EmuFolders::Cache, "star_warm_vulkan.bin"));
+	if (GSConfig.DisableShaderCache || !g_vulkan_shader_cache)
+		return;
+
+	const bool fresh = g_vulkan_shader_cache->IsFresh();
+	std::vector<std::string> work = m_warm_list.Missing(fresh ? m_warm_list.Forget() : std::vector<std::string>{});
+	if (work.empty() || !GSWarm::Enabled())
+	{
+		Console.WriteLn("Pipeline warm-up: %s (GPU tag %016" PRIX64 ")",
+			work.empty() ? "nothing to build" : "off (PS2X_GS_WARMUP=0)", tag);
+		return;
+	}
+	const bool background = !fresh;
+	const unsigned threads = GSWarm::Threads(background);
+	Console.WriteLn("Pipeline warm-up: %zu pipelines on %u thread(s), %s (GPU tag %016" PRIX64 ")", work.size(), threads,
+		background ? "in the background" : "the game waits", tag);
+	m_warm_flushed = false;
+	m_warm_pool.Start(std::move(work), threads, background, [this](const std::string& entry) { WarmOne(entry); });
+	if (!background)
+		FinishWarmup(true);
+}
+
+void GSDeviceVK::WarmOne(const std::string& entry)
+{
+	PipelineSelector p;
+	std::memcpy(&p, entry.data(), sizeof(p));
+	if (p.topology >= 3 || p.bs.op >= 3) // not a selector the GS makes (a damaged list): BuildTFXPipeline's tables
+		return;
+	VkShaderModule vs = g_vulkan_shader_cache->GetVertexShader(GetTFXVertexShaderSource(p.vs));
+	VkShaderModule fs = g_vulkan_shader_cache->GetFragmentShader(GetTFXFragmentShaderSource(TFXPipelineFragmentSelector(p)));
+	if (vs != VK_NULL_HANDLE && fs != VK_NULL_HANDLE)
+	{
+		if (VkPipeline pipeline = BuildTFXPipeline(p, vs, fs); pipeline != VK_NULL_HANDLE)
+		{
+			vkDestroyPipeline(m_device, pipeline, nullptr);
+			m_warm_list.Learn(&p);
+		}
+	}
+	if (vs != VK_NULL_HANDLE)
+		vkDestroyShaderModule(m_device, vs, nullptr);
+	if (fs != VK_NULL_HANDLE)
+		vkDestroyShaderModule(m_device, fs, nullptr);
+}
+
+// wait: until every pipeline is built (the fresh-cache start); else only when the background warm-up has ended.
+// Either way the pipeline cache is written then, so a crash later doesn't lose the work.
+void GSDeviceVK::FinishWarmup(bool wait)
+{
+	if (m_warm_flushed || (!wait && m_warm_pool.Running()))
+		return;
+	m_warm_pool.Wait();
+	m_warm_flushed = true;
+	g_vulkan_shader_cache->FlushPipelineCache();
+	Console.WriteLn("Pipeline warm-up: done (%zu of %zu)", m_warm_pool.Done(), m_warm_pool.Total());
 }
 
 bool GSDeviceVK::BindDrawPipeline(const PipelineSelector& p)

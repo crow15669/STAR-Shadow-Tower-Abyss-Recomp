@@ -322,14 +322,21 @@ void VKShaderCache::Open()
 		const std::string blob_filename = base_filename + ".bin";
 
 		if (!ReadExistingShaderCache(index_filename, blob_filename))
+		{
 			CreateNewShaderCache(index_filename, blob_filename);
+			m_fresh = true; // pcsx2gs (Kamite)
+		}
 
 		if (!ReadExistingPipelineCache())
+		{
 			CreateNewPipelineCache();
+			m_fresh = true; // pcsx2gs (Kamite)
+		}
 	}
 	else
 	{
 		CreateNewPipelineCache();
+		m_fresh = true; // pcsx2gs (Kamite)
 	}
 }
 
@@ -338,7 +345,8 @@ VkPipelineCache VKShaderCache::GetPipelineCache(bool set_dirty /*= true*/)
 	if (m_pipeline_cache == VK_NULL_HANDLE)
 		return VK_NULL_HANDLE;
 
-	m_pipeline_cache_dirty |= set_dirty;
+	if (set_dirty)
+		m_pipeline_cache_dirty = true;
 	return m_pipeline_cache;
 }
 
@@ -626,9 +634,13 @@ VKShaderCache::CacheIndexKey VKShaderCache::GetCacheKey(u32 type, const std::str
 std::optional<VKShaderCache::SPIRVCodeVector> VKShaderCache::GetShaderSPV(u32 type, std::string_view shader_code)
 {
 	const auto key = GetCacheKey(type, shader_code);
+	std::unique_lock lock(m_mutex); // pcsx2gs (Kamite): the warm-up's threads
 	auto iter = m_index.find(key);
 	if (iter == m_index.end())
+	{
+		lock.unlock(); // pcsx2gs (Kamite): compiled outside the lock, added under it (CompileAndAddShaderSPV)
 		return CompileAndAddShaderSPV(key, shader_code);
+	}
 
 	std::optional<SPIRVCodeVector> spv = SPIRVCodeVector(iter->second.blob_size);
 
@@ -684,6 +696,9 @@ std::optional<VKShaderCache::SPIRVCodeVector> VKShaderCache::CompileAndAddShader
 	if (!spv.has_value())
 		return {};
 
+	std::lock_guard lock(m_mutex); // pcsx2gs (Kamite): another thread may have added the same shader meanwhile
+	if (m_index.count(key))
+		return spv;
 	if (!m_blob_file || std::fseek(m_blob_file, 0, SEEK_END) != 0)
 		return spv;
 

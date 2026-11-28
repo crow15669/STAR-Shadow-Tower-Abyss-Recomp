@@ -7,6 +7,7 @@
 #include "GS/GSVector.h"
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/DX11/D3D11ShaderCache.h"
+#include "GSWarmList.h" // pcsx2gs (Kamite): shader warm-up
 
 #include <string_view>
 #include <unordered_map>
@@ -411,6 +412,24 @@ public:
 
 	void UpdateSubresource(ID3D11Buffer* buffer, const void* cb_uniforms, void* cached_cb_uniforms, size_t cb_uniforms_size);
 
+	// pcsx2gs (Kamite): the shader warm-up (compat/GSWarmList.h): the TFX shaders' macros split out of SetupVS /
+	// SetupPS so the warm-up's threads compile the same shaders into the cache.
+	ShaderMacro TFXVertexMacros(VSSelector sel) const;
+	ShaderMacro TFXPixelMacros(const PSSelector& sel) const;
+	struct WarmEntry
+	{
+		u32 kind; // 0 vertex shader (key in data), 1 pixel shader (PSSelector in data)
+		u32 pad;
+		u8 data[16];
+	};
+	static_assert(sizeof(PSSelector) <= 16);
+	void LearnShader(u32 kind, const void* selector, size_t size);
+	void StartWarmup();
+	void WarmOne(const std::string& entry);
+	void FinishWarmup(bool wait);
+	GSWarm::List m_warm_list;
+	GSWarm::Pool m_warm_pool;
+	bool m_warm_done = true;
 	void SetupVS(VSSelector sel, const GSHWDrawConfig::VSConstantBuffer* cb);
 	void SetupPS(const PSSelector& sel, const GSHWDrawConfig::PSConstantBuffer* cb, PSSamplerSelector ssel);
 	void SetupOM(OMDepthStencilSelector dssel, OMBlendSelector bsel, u8 afix);

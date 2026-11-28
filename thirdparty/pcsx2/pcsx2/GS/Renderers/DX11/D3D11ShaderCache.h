@@ -6,6 +6,7 @@
 
 #include "common/HashCombine.h"
 
+#include <mutex>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -17,6 +18,9 @@ public:
 	~D3D11ShaderCache();
 
 	bool UsingDebugShaders() const { return m_debug; }
+	// pcsx2gs (Kamite): the cache was started anew at Open (none yet, damaged, another version): nothing built before
+	// is in it (compat/GSWarmList.h). GetShaderBlob may be called from the warm-up's threads too (m_mutex).
+	bool IsFresh() const { return m_fresh; }
 
 	bool Open(D3D_FEATURE_LEVEL feature_level, bool debug);
 	void Close();
@@ -90,4 +94,6 @@ private:
 
 	D3D::ShaderModel m_shader_model = D3D::ShaderModel::SM50;
 	bool m_debug = false;
+	bool m_fresh = false; // pcsx2gs (Kamite)
+	std::mutex m_mutex; // pcsx2gs (Kamite)
 };

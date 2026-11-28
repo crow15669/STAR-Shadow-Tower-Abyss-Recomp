@@ -7,8 +7,10 @@
 
 #include "common/HashCombine.h"
 
+#include <atomic>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,6 +30,11 @@ public:
 
 	/// Writes pipeline cache to file, saving all newly compiled pipelines.
 	bool FlushPipelineCache();
+
+	// pcsx2gs (Kamite): the shader or pipeline cache was started anew at this open (none yet, another driver or GPU,
+	// a damaged file): nothing built before is in it (GSWarmList.h). The shader getters below may be called from the
+	// warm-up's worker threads too (the index and the files are behind m_mutex; compiling happens outside it).
+	bool IsFresh() const { return m_fresh; }
 
 	VkShaderModule GetVertexShader(std::string_view shader_code);
 	VkShaderModule GetFragmentShader(std::string_view shader_code);
@@ -96,7 +103,9 @@ private:
 	CacheIndex m_index;
 
 	VkPipelineCache m_pipeline_cache = VK_NULL_HANDLE;
-	bool m_pipeline_cache_dirty = false;
+	std::atomic<bool> m_pipeline_cache_dirty{false}; // pcsx2gs (Kamite): atomic (warm-up threads)
+	std::mutex m_mutex; // pcsx2gs (Kamite)
+	bool m_fresh = false; // pcsx2gs (Kamite)
 };
 
 extern std::unique_ptr<VKShaderCache> g_vulkan_shader_cache;

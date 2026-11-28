@@ -82,7 +82,14 @@ bool D3D11ShaderCache::Open(D3D_FEATURE_LEVEL feature_level, bool debug)
 		const std::string blob_filename = base_filename + ".bin";
 
 		if (!ReadExisting(index_filename, blob_filename))
+		{
+			m_fresh = true; // pcsx2gs (Kamite)
 			return CreateNew(index_filename, blob_filename);
+		}
+	}
+	else
+	{
+		m_fresh = true; // pcsx2gs (Kamite)
 	}
 
 	return true;
@@ -275,9 +282,13 @@ wil::com_ptr_nothrow<ID3DBlob> D3D11ShaderCache::GetShaderBlob(D3D::ShaderType t
 	const char* entry_point /* = "main" */)
 {
 	const auto key = GetCacheKey(type, shader_code, macros, entry_point);
+	std::unique_lock lock(m_mutex); // pcsx2gs (Kamite): the warm-up's threads
 	auto iter = m_index.find(key);
 	if (iter == m_index.end())
+	{
+		lock.unlock(); // pcsx2gs (Kamite): compiled outside the lock, added under it
 		return CompileAndAddShaderBlob(key, shader_code, macros, entry_point);
+	}
 
 	wil::com_ptr_nothrow<ID3DBlob> blob;
 	HRESULT hr = D3DCreateBlob(iter->second.blob_size, blob.put());
@@ -411,6 +422,9 @@ wil::com_ptr_nothrow<ID3DBlob> D3D11ShaderCache::CompileAndAddShaderBlob(const C
 	if (!blob)
 		return {};
 
+	std::lock_guard lock(m_mutex); // pcsx2gs (Kamite): another thread may have added the same shader meanwhile
+	if (m_index.count(key))
+		return blob;
 	if (!m_blob_file || std::fseek(m_blob_file, 0, SEEK_END) != 0)
 		return blob;
 
