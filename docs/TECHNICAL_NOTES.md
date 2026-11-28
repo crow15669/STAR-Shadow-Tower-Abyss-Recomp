@@ -351,6 +351,14 @@ the camera and every object moved part of the way from the previous frame to thi
 - Texture uploads are repeated in every extra pass: the game loads different textures to the same place within one
   frame.
 - The rate adapts: when a picture per refresh does not fit, every second or third refresh gets one.
+- **A picture must reach the renderer as soon as it is drawn.** The queue to the renderer's thread
+  (`gs_threaded_backend.cpp`) hands a chunk over when 64 KB have gathered or at a vsync. The marker that says "keep
+  this picture" is 32 bytes, so it used to wait for the next run's data, and the marker of a frame's last run for the
+  next vsync: the picture was ready up to 12 ms after its turn, and on a real screen the whole row of pictures then
+  stood one refresh late until one was left out to pull it back. Seen as a stumble in a steady turn, worst with a
+  controller (two runs before a frame's first picture) and right after the view stops. A marker that ends a run is now
+  published at once (`PS2X_GS_MARKER_PUBLISH=0`: as before). No still picture shows this fault: read the times, not
+  the pictures (`tools/pacewhy.py`, `tools/paceruns.py`, `tools/ringlate.py`).
 - **The self-test:** `STAR_SMOOTH_SELFTEST=1` places every extra pass at the frame's own state, so all pictures of a
   frame must be identical; `tools/selftest.py` compares them. Run it after any change to the passes.
 
@@ -496,6 +504,7 @@ Switches used most (environment variables; hundreds more are named in code comme
 | `PS2X_PCSX2_SNAPSHOT_DIR`, `PS2X_PCSX2_SNAPSHOT_EVERY` | Renderer snapshots (BMP; `tools/bmp2png.py`) |
 | `PS2X_PCSX2_PRESENT_DUMP=<folder>:<first>:<last>` | The pictures exactly as presented |
 | `PS2X_PCSX2_RING_SAVE_AT=<seconds>:<folder>` | An F1 catch in a hidden run |
+| `PS2X_PCSX2_PACE_LOG=<file>` | When every picture was ready, due and presented (`tools/pacewhy.py`, `paceruns.py`, `pacecheck.py`) |
 | `STAR_REFRESH_HZ=<rate>` | Pretend a screen of that rate |
 | `STAR_SMOOTH_SELFTEST=1` | The self-test of the extra passes |
 | `PS2X_CALL_WATCH=<hex value>` | Every call whose arguments hold that value: finds the functions that handle a thing |

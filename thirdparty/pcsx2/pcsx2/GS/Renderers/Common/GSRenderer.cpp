@@ -733,6 +733,9 @@ namespace pcsx2gs
 }
 
 // PS2X_PCSX2_PACE_LOG=<file>: a line for every ordinary picture queued (q) and presented (p), for tools/pacecheck.py.
+// STAR 2026-11-27, for tools/pacewhy.py and paceruns.py: of the host's in-between pictures, a = ready (kept), r = ready
+// again (repeated), k = its present called, e = that call returned (the id in the target column); m = a marker of the
+// host's runs over a frame reached this thread (its kind in the hold column); V = a vsync handled, from now to time.
 static std::FILE* PaceLogFile()
 {
 	static std::FILE* const file = []() -> std::FILE* {
@@ -743,6 +746,17 @@ static std::FILE* PaceLogFile()
 		return f;
 	}();
 	return file;
+}
+
+namespace pcsx2gs
+{
+	// m = a marker of the host's runs over a frame reached this thread (GSRendererHW::FrameDoubleMarker): its kind in
+	// the hold column, its id in the target column.
+	void PaceNote(u32 kind, u32 id)
+	{
+		if (std::FILE* const log = PaceLogFile())
+			std::fprintf(log, "m,%lld,%u,0,0,%u,0,0\n", static_cast<long long>(FrameClock()), id, kind);
+	}
 }
 
 // The last pictures handed to the screen, kept small (480x360) in a ring of 512: 3.5 seconds at 144 a second. For a
@@ -1080,6 +1094,10 @@ bool GSRenderer::QueueKept(GSTexture* src, const GSVector4& uv, int w, int h, co
 		m_kept_active_until = pcsx2gs::FrameClock() + pcsx2gs::FrameClockPerSecond() / 4;
 	}
 	m_kept_queue.push_back(KeptEntry{picture, time, id, hold, paced});
+	// the log: a = an in-between picture is ready (its id in the target column)
+	if (!paced)
+		if (std::FILE* const log = PaceLogFile())
+			std::fprintf(log, "a,%lld,%u,0,%lld,0,0,0\n", static_cast<long long>(pcsx2gs::FrameClock()), id, static_cast<long long>(time));
 	return true;
 }
 
@@ -1090,6 +1108,8 @@ void GSRenderer::RepeatPicture(u32 id)
 		return;
 	m_kept_last->refs++;
 	m_kept_queue.push_back(KeptEntry{m_kept_last, time, id, -1, false});
+	if (std::FILE* const log = PaceLogFile()) // r = the picture kept last is ready again under this id
+		std::fprintf(log, "r,%lld,%u,0,%lld,0,0,0\n", static_cast<long long>(pcsx2gs::FrameClock()), id, static_cast<long long>(time));
 	m_kept_active_until = pcsx2gs::FrameClock() + pcsx2gs::FrameClockPerSecond() / 4;
 }
 
@@ -1100,8 +1120,8 @@ void GSRenderer::PresentKept(const KeptEntry& entry, int hold)
 		DumpPresented(tex, nullptr, GSVector4::zero(), entry.picture->draw_rect, ("-id" + std::to_string(entry.id)).c_str());
 	// the log: p = an ordinary picture, k = one of the host's in-between pictures (its hold: the host's)
 	if (std::FILE* const log = PaceLogFile())
-		std::fprintf(log, "%c,%lld,0,0,%lld,%d,0,0\n", entry.paced ? 'p' : 'k', static_cast<long long>(pcsx2gs::FrameClock()),
-			static_cast<long long>(entry.time), hold);
+		std::fprintf(log, "%c,%lld,%u,0,%lld,%d,0,0\n", entry.paced ? 'p' : 'k', static_cast<long long>(pcsx2gs::FrameClock()),
+			entry.paced ? 0u : entry.id, static_cast<long long>(entry.time), hold);
 	if (entry.id != 0xFFFFFFFFu)
 		RingNote(tex, GSVector4(0.0f, 0.0f, 1.0f, 1.0f), entry.id, entry.paced ? 'v' : 'k', entry.picture->stats);
 	pcsx2gs::g_presentHold.store(hold, std::memory_order_relaxed);
@@ -1114,6 +1134,10 @@ void GSRenderer::PresentKept(const KeptEntry& entry, int hold)
 			s_tv_shader_indices[GSConfig.TVShader], shader_time, BilnIf(GSConfig.LinearPresent != GSPostBilinearMode::Off));
 		EndPresentFrame();
 		pcsx2gs::NotePresented();
+		// the log: e = the present call of the picture above has returned
+		if (std::FILE* const log = PaceLogFile())
+			std::fprintf(log, "e,%lld,%u,0,%lld,%d,0,0\n", static_cast<long long>(pcsx2gs::FrameClock()), entry.paced ? 0u : entry.id,
+				static_cast<long long>(entry.time), hold);
 		if (!entry.paced && m_kept_holds && m_kept_period > 0)
 		{
 			// for KeptSlipFix: handed over 1 ms after a refresh (the host's times), meant for the refresh after it
@@ -1278,6 +1302,16 @@ s64 GSRenderer::PresentPoll()
 
 void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 {
+	// the log: V = this thread's handling of a vsync, from `now` to `time`
+	struct VSyncSpan
+	{
+		s64 from = pcsx2gs::FrameClock();
+		~VSyncSpan()
+		{
+			if (std::FILE* const log = PaceLogFile())
+				std::fprintf(log, "V,%lld,0,0,%lld,0,0,0\n", static_cast<long long>(from), static_cast<long long>(pcsx2gs::FrameClock()));
+		}
+	} vsync_span;
 	m_kept_field = field;
 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
 	{

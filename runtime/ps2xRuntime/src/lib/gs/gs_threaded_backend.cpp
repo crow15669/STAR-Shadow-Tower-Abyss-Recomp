@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_pcsx2_backend.h"
 #include "runtime/gs/gs_shared_present.h"
+#include "runtime/ps2_async_vif.h"
 #include "ThreadPriority.h"
 #include "ThreadNaming.h"
 
@@ -668,6 +669,30 @@ void GSThreadedBackend::RawGif(const uint8_t *data, uint32_t sizeBytes)
 {
     if (data && sizeBytes >= 16u)
         Enqueue(Op::RawGif, data, sizeBytes & ~15u);
+    // STAR 2026-11-27: a marker that ends a run over a frame (ps2_async_vif.h: 1 = keep this picture, 4 and 6 = the
+    // frame's runs are over) is published at once. The queue hands a chunk over when 64 KB have gathered or at a
+    // vsync, so the marker of a picture waited for the next run's data, and the one of a frame's last run (or of a
+    // frame without passes: its only run) for the next vsync, up to a field later: that picture reached the screen up
+    // to 12 ms after its turn, and on a real screen the whole row of pictures then stood a refresh late until one was
+    // left out to bring it back (the user: "struggling to keep up with in-between frames", F1 catches of 2026-11-27).
+    // PS2X_GS_MARKER_PUBLISH=0: as before.
+    if (data && sizeBytes == 32u)
+    {
+        uint32_t low = 0u, high = 0u;
+        std::memcpy(&low, data + 16u, sizeof(low));
+        std::memcpy(&high, data + 20u, sizeof(high));
+        const uint32_t kind = low & 0xFFu;
+        if (high == ps2x::asyncvif::kFrameDoubleMagic && data[24] == 0x0Fu && (kind == 1u || kind == 4u || kind == 6u))
+        {
+            static const bool on = []
+            { const char *v = std::getenv("PS2X_GS_MARKER_PUBLISH"); return !(v && *v == '0'); }();
+            if (on)
+            {
+                std::lock_guard<std::mutex> lock(m_producerMutex);
+                PublishLocked();
+            }
+        }
+    }
 }
 
 // The field ends: published at once, so the GS thread presents it without waiting for more GIF data.

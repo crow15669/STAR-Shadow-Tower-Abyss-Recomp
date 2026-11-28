@@ -5937,11 +5937,13 @@ void GSRendererHW::SetupIA(float target_scale, float sx, float sy, bool req_vert
 namespace pcsx2gs
 {
 	extern std::atomic<uint32_t> g_frame; // compat/Bridge.cpp: Vsync
+	void PaceNote(u32 kind, u32 id);      // GSRenderer.cpp: the pace log
 }
 
 void GSRendererHW::FrameDoubleMarker(u32 arg)
 {
 	const u32 kind = arg & 0xFFu, id = arg >> 8;
+	pcsx2gs::PaceNote(kind, id);
 	// Kinds: 1 keep the picture, 2 the kept picture again, 3 the extra passes begin (the frame buffer is saved),
 	// 4 they are over (it is put back), 5 the game's own run of a frame begins, 6 a frame without passes is over.
 	// From 5 or 3 to 4 or 6 a run over the frame is in the making; 1, 2, 4 and 6 are the places between two runs.
