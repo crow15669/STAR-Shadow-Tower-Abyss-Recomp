@@ -9,7 +9,7 @@
 // play_previous_1..3. A run whose output is already taken (a test, a script's "> file") is left alone.
 namespace star
 {
-    constexpr const char *kVersion = "0.9.0";
+    constexpr const char *kVersion = "0.9.1";
 
     // Starts the log when the output is not taken already, and makes the program's folder the working folder (logs,
     // F1 catches, memory cards and caches then all lie next to the program, whatever the shortcut's "start in" says).

@@ -431,7 +431,8 @@ whose `[joy]` lines tell what the game's pad read).
 Taken from God Hand: Rearmed. Every pipeline the renderer builds is noted in `shadercache_pcsx2/star_warm_vulkan.bin`
 (`star_warm_dx11.bin`); at the next start whatever the caches lack is built on worker threads before play, instead of
 stalling the first time each effect appears. A list shipped as `resources/gs_warm/<api>.bin` would do the same for a
-first run (`tools/gs/warm_merge.py` merges lists); none is shipped yet. Entries carry a hash of the graphics card's
+first run (`tools/gs/warm_merge.py` merges lists). A first one is shipped since 0.9.1: 189 pipelines learned on
+one graphics card in an evening's play, so it is far from everything. Entries carry a hash of the graphics card's
 features, so a list only helps cards with the same features. `PS2X_GS_WARMUP=0` switches it off.
 
 ### The launcher and the settings table
