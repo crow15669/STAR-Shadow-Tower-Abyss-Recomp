@@ -895,17 +895,27 @@ namespace star
                 // their turns come: pass j is done at own + j passes and due at own + a pass + 3 ms + j refreshes.
                 // (The user's F1 catches pictures_6 and _7 were at every second refresh throughout: the count here
                 // still held the pass that is no longer run.)
+                // STAR 2026-11-27: the same without the mouse (a controller): the own run is the first picture there too
+                // (see where the passes are made), so the count is one pass fewer; each is still due a refresh apart.
                 static const bool ownAlways = []
                 {
                     const char *test = std::getenv("STAR_SMOOTH_SELFTEST"), *own = std::getenv("STAR_LIVE_OWN");
                     return !(test && *test == '1') && !(own && *own == '0');
                 }();
-                const bool ownIsPicture = ownAlways && ps2x::asyncvif::currentJobTag() != 0u;
+                static const bool ownWithPad = []
+                {
+                    const char *test = std::getenv("STAR_SMOOTH_SELFTEST"), *own = std::getenv("STAR_PAD_OWN");
+                    return !(test && *test == '1') && !(own && *own == '0');
+                }();
+                const bool tagged = ps2x::asyncvif::currentJobTag() != 0u;
+                const bool ownIsPicture = tagged ? ownAlways : ownWithPad;
                 const auto fits = [&](int stride, double share)
                 {
                     if (!ownIsPicture)
                         return ownMs + passes(stride) * passMs <= frameMs * share && passMs <= 1.15 * periodMs * stride;
                     const double extra = std::max(0.0, passes(stride) - 1.0);
+                    if (!tagged)
+                        return ownMs + extra * passMs <= frameMs * share && passMs <= 1.15 * periodMs * stride;
                     return ownMs + extra * passMs <= frameMs * share && (extra - 1.0) * passMs <= 3.0 + extra * periodMs * stride;
                 };
                 int wanted = 1;
@@ -1715,7 +1725,19 @@ namespace star
             // ids are printed; tools\selftest.py compares the presented pictures (PS2X_PCSX2_PRESENT_DUMP).
             static const bool selftest = []
             { const char *v = std::getenv("STAR_SMOOTH_SELFTEST"); return v && *v == '1'; }();
-            if (selftest)
+            // STAR_SMOOTH_SELFTEST=2 (2026-11-27): every picture of a frame at one and the same time fraction (0.999), the
+            // first of them made the ordinary way, which is the game's own run with a pass's patches. They must be
+            // identical again: this checks the own run as a picture against the passes (mode 1 checks the passes against
+            // the game's own, unpatched run). The ids are printed for tools\selftest.py as in mode 1.
+            static const bool selftestOwn = []
+            { const char *v = std::getenv("STAR_SMOOTH_SELFTEST"); return v && *v == '2'; }();
+            // STAR 2026-11-27: without the mouse too (a controller) the own run is the frame's first picture, patched
+            // like a pass. Six runs a frame for five pictures did not fit in a heavy scene (the user's F1 catches
+            // pictures_2 and _3: 5 to 7 ms a run, the last pass given up in 40% of the frames: a picture missing 12 times
+            // a second, "a very slight jittering ... with controller aiming that isn't happening with mouse aiming").
+            // STAR_PAD_OWN=0: as before.
+            static const bool padOwn = [] { const char *v = std::getenv("STAR_PAD_OWN"); return !(v && *v == '0'); }();
+            if (selftest || selftestOwn)
             {
                 std::string ids;
                 for (const Slot &slot : slots)
@@ -1731,9 +1753,12 @@ namespace star
                 static const double testT = [] { const char *v = std::getenv("STAR_SMOOTH_TEST_T"); return v && *v ? std::atof(v) : 9.0; }();
                 if (selftest)
                     slot.t = slot.id == slots.front().id ? 2.0 : (testT < 8.0 ? testT : 1.0);
+                else if (selftestOwn)
+                    slot.t = 0.999;
                 else if (testT < 8.0 && slot.t <= 0.9995)
                     slot.t = testT;
-                if (!liveLook && (selftest ? slot.t > 1.5 : slot.t > 0.9995))
+                // (not after the own run has been given a pass's patches: its picture is no longer the frame's own state)
+                if (!liveLook && plan.own.patches.empty() && (selftest ? slot.t > 1.5 : slot.t > 0.9995))
                 {
                     plan.shown.push_back(slot.id); // this refresh falls on the frame's own state
                     continue;
@@ -1818,6 +1843,12 @@ namespace star
                     plan.own = std::move(pass);
                     plan.beforeOwn = &lateCameraOwn;
                     late.ownFirst = true;
+                    continue;
+                }
+                if (!liveLook && padOwn && !selftest && plan.own.patches.empty() && plan.passes.empty() && plan.shown.empty() && !pass.patches.empty())
+                {
+                    plan.shown.push_back(slot.id); // kept right after the own run, under this slot's id
+                    plan.own = std::move(pass);
                     continue;
                 }
                 plan.passes.push_back(std::move(pass));

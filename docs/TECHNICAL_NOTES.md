@@ -351,6 +351,12 @@ the camera and every object moved part of the way from the previous frame to thi
 - Texture uploads are repeated in every extra pass: the game loads different textures to the same place within one
   frame.
 - The rate adapts: when a picture per refresh does not fit, every second or third refresh gets one.
+- **The game's own run of a frame is the frame's first picture.** It is given a pass's patches before it runs, so a
+  frame of five pictures costs five runs over the drawing stream, not six. This was first done for the mouse only;
+  with a controller the sixth run did not fit in heavy scenes (5 to 7 ms a run) and the last picture of a frame was
+  given up several times a second: a faint stumble that mouse aiming did not have (`STAR_PAD_OWN=0`: as before).
+  The frame buffer the game is left with is then that first picture, not the frame's exact state.
+  `STAR_SMOOTH_SELFTEST=2` checks the own run as a picture against the passes.
 - **A picture must reach the renderer as soon as it is drawn.** The queue to the renderer's thread
   (`gs_threaded_backend.cpp`) hands a chunk over when 64 KB have gathered or at a vsync. The marker that says "keep
   this picture" is 32 bytes, so it used to wait for the next run's data, and the marker of a frame's last run for the
