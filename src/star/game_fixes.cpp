@@ -12,6 +12,7 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_pad_tap.h"
 #include "runtime/ps2_input_options.h"
+#include "ps2_host_gamepads.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1084,6 +1085,53 @@ namespace star
             return value;
         }
 
+        // STAR_JOY_TEST=<from>-<to>:<kind>:<index>:<value>[,...] (tests of a controller's set-up, star/pad_map.h): during
+        // the frames from..to of play the test joystick (PS2X_TEST_JOYSTICK, ps2_host_gamepads.h) has that element at
+        // that value (kind 0 a button, 1 an axis, 2 a hat), and at 0 after them. "[joy]" lines tell what the game's
+        // pad reads whenever it changes: the buttons held and the sticks as scePadRead gave them.
+        void testJoystick(uint8_t *rdram, uint64_t frame)
+        {
+            struct Step
+            {
+                unsigned long long from, to;
+                int kind, index, value;
+            };
+            static const std::vector<Step> steps = []
+            {
+                std::vector<Step> list;
+                const char *text = std::getenv("STAR_JOY_TEST");
+                while (text && *text)
+                {
+                    Step step{};
+                    if (std::sscanf(text, "%llu-%llu:%d:%d:%d", &step.from, &step.to, &step.kind, &step.index, &step.value) == 5)
+                        list.push_back(step);
+                    text = std::strchr(text, ',');
+                    if (text)
+                        ++text;
+                }
+                return list;
+            }();
+            if (steps.empty())
+                return;
+            for (const Step &step : steps)
+                if (frame == step.from)
+                    ps2_host_gamepads::testJoystick(step.kind, step.index, step.value);
+                else if (frame == step.to + 1u)
+                    ps2_host_gamepads::testJoystick(step.kind, step.index, 0);
+            static uint64_t before = ~0ull;
+            uint64_t now = guestHalf(rdram, kPadState);
+            for (uint32_t i = 4u; i < 8u; ++i)
+                now = (now << 8) | rdram[kPadRaw + i];
+            static int lines = 0;
+            if (now != before && lines < 400)
+            {
+                ++lines;
+                before = now;
+                std::printf("[joy] frame %llu pad %04x sticks right %u %u left %u %u%c", static_cast<unsigned long long>(frame),
+                            guestHalf(rdram, kPadState), rdram[kPadRaw + 4u], rdram[kPadRaw + 5u], rdram[kPadRaw + 6u], rdram[kPadRaw + 7u], 10);
+            }
+        }
+
         void setGuestHalf(uint8_t *rdram, uint32_t address, uint16_t value)
         {
             std::memcpy(rdram + address, &value, 2);
@@ -1542,6 +1590,7 @@ namespace star
                     since = ns;
                 }
             }
+            testJoystick(rdram, mk.frame);
             mk.yaw = mk.pitch = 0.0f;
             mk.active = false;
             if (live().mouseKeyboard.load(std::memory_order_relaxed))

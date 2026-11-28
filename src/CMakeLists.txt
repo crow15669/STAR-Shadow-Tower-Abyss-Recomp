@@ -59,7 +59,7 @@ if(MSVC)
         COMPILE_OPTIONS "/Od" SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
-add_executable(star main.cpp star/sha256.cpp star/host_sampler.cpp star/game_fixes.cpp star/window_watch.cpp star/frame_double.cpp star/settings_menu.cpp star/debug_menu.cpp star/shadow_volumes.cpp star/options.cpp star/bindings.cpp star/play_log.cpp)
+add_executable(star main.cpp star/sha256.cpp star/host_sampler.cpp star/game_fixes.cpp star/window_watch.cpp star/frame_double.cpp star/settings_menu.cpp star/debug_menu.cpp star/shadow_volumes.cpp star/options.cpp star/bindings.cpp star/pad_map.cpp star/play_log.cpp)
 set_target_properties(star PROPERTIES OUTPUT_NAME STAR RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 target_link_libraries(star PRIVATE star_game_code ps2_runtime)
 # The launcher (star/launcher.cpp): ImGui on the game's raylib window, as the runtime's F12 debugger (PS2X_ENABLE_DEBUG_UI).

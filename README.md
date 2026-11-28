@@ -62,6 +62,10 @@ Your choices are kept in `STAR settings.ini` next to the program.
 A controller works as it does on the PS2. For mouse and keyboard, the controls are listed, and can be changed,
 under Experimental > Change controls.
 
+Some generic USB controllers are not recognised by themselves. When one is connected, the launcher's Gameplay tab
+shows **Set up its buttons...**: tell it once which of the controller's buttons is which PS2 button. What each button
+does in the game is still chosen in the game's own options (Control Type).
+
 Memory card saves are in the `memcards` folder and save states in `states`, both next to the program.
 
 ## Known issues

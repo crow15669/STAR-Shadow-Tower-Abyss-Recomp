@@ -1,5 +1,6 @@
 #include "star/bindings.h"
 
+#include "star/pad_map.h"
 #include "runtime/ps2_input_options.h"
 
 #include "raylib.h"
@@ -464,6 +465,10 @@ namespace star::bindings
         }
         if (action.controller)
             value += (value.empty() ? "" : ";") + std::string(action.controller);
+        // STAR 2026-11-27: and the button of a controller the player set up (star/pad_map.h)
+        if (action.padKey)
+            if (const std::string joystick = padmap::liveEnvPart(action.padKey); !joystick.empty())
+                value += (value.empty() ? "" : ";") + joystick;
         return value;
     }
 

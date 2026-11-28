@@ -64,6 +64,14 @@ namespace ps2_host_input
     // A binding of player n (0-based) from the environment, changed while the game runs: PS2X_PAD<n+1>_<KEY> becomes
     // `value` and the bindings are rebuilt, at the window thread's next sample. Any thread.
     void requestEnvBinding(uint32_t pad, const std::string &key, const std::string &value);
+    // STAR 2026-11-27 (the controller set-up screen, star/pad_map.h): the name of the unmapped joystick (a controller
+    // SDL does not know as a gamepad) the player set up. Its numbered elements ("SDL-0/Button 3", "+Axis 2",
+    // "Hat 1 North") are in player 1's bindings beside the gamepad's, under the same device number, and:
+    //   - they are read from joysticks of this name only (a wheel or a flight stick beside it presses nothing);
+    //   - a button, hat or axis newly pressed on one makes it player 1's controller, as a gamepad's button does,
+    //     and it is player 1's from the start when no gamepad is there.
+    // "" (the default): numbered elements are read from whatever joystick has the number. Any thread.
+    void setRawJoystickName(const std::string &name);
     // A capture for a controls screen: from begin, player 1's input is held from the game; the keys and buttons down
     // then must go up first, and the next key, mouse button or wheel turn is the result. Esc, an F-key or the window
     // losing the focus cancels. bindCaptureResult: 0 waiting (or none begun), 1 captured ("Keyboard/<name>",

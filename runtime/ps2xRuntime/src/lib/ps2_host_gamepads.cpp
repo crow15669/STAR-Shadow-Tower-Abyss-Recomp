@@ -49,6 +49,7 @@ namespace ps2_host_gamepads
         {
 #if defined(PS2X_HAS_SDL3)
             SDL_Gamepad *gamepad = nullptr;
+            SDL_Joystick *joystick = nullptr;
             SDL_JoystickID id = 0;
 #endif
             std::string name;
@@ -59,6 +60,10 @@ namespace ps2_host_gamepads
         };
 
         std::array<Device, kMaxDevices> g_devices;
+#if defined(PS2X_HAS_SDL3)
+        std::atomic<SDL_Joystick *> g_testJoystick{nullptr};      // STAR: PS2X_TEST_JOYSTICK's last (testJoystick)
+        std::atomic<SDL_Joystick *> g_testJoystickFirst{nullptr}; // and its first
+#endif
         bool g_sdl = false; // SDL is open and owns the devices; false = GLFW's gamepads
 
         // GLFW's names come from SDL_GameControllerDB ("PS4 Controller", "PS5 Controller", "Xbox Controller",
@@ -106,12 +111,20 @@ namespace ps2_host_gamepads
             for (const Device &device : g_devices)
                 if (device.gamepad && device.id == id)
                     return;
+            for (Device &device : g_devices)
+                if (device.joystick && device.id == id)
+                {
+                    SDL_CloseJoystick(device.joystick);
+                    device = Device{};
+                }
             SDL_Gamepad *gamepad = SDL_OpenGamepad(id);
             if (!gamepad)
             {
                 std::cerr << "[input] could not open controller " << id << ": " << SDL_GetError() << std::endl;
                 return;
             }
+            // Controllers number as if no unmapped joystick were there (#44's follow-up: a joystick plugged in or found
+            // first doesn't renumber the controller players already bound as SDL-0): one in the way moves up.
             int slot = SDL_GetGamepadPlayerIndex(gamepad);
             if (slot < 0 || slot >= kMaxDevices || g_devices[static_cast<size_t>(slot)].gamepad)
             {
@@ -124,6 +137,21 @@ namespace ps2_host_gamepads
             {
                 SDL_CloseGamepad(gamepad);
                 return;
+            }
+            if (Device &raw = g_devices[static_cast<size_t>(slot)]; raw.joystick)
+            {
+                int free = -1;
+                for (int i = 0; i < kMaxDevices && free < 0; ++i)
+                    if (i != slot && !g_devices[static_cast<size_t>(i)].gamepad && !g_devices[static_cast<size_t>(i)].joystick)
+                        free = i;
+                if (free >= 0)
+                {
+                    std::cerr << "[input] SDL-" << slot << " (" << raw.name << ", raw joystick) is now SDL-" << free << std::endl;
+                    g_devices[static_cast<size_t>(free)] = raw;
+                }
+                else
+                    SDL_CloseJoystick(raw.joystick);
+                raw = Device{};
             }
             Device &device = g_devices[static_cast<size_t>(slot)];
             device = Device{};
@@ -172,15 +200,52 @@ namespace ps2_host_gamepads
                       << " buttons)" << std::endl;
         }
 
+        void addJoystick(SDL_JoystickID id)
+        {
+            if (SDL_IsGamepad(id))
+            {
+                addGamepad(id);
+                return;
+            }
+            for (const Device &device : g_devices)
+                if ((device.gamepad || device.joystick) && device.id == id)
+                    return;
+            SDL_Joystick *joystick = SDL_OpenJoystick(id);
+            if (!joystick)
+            {
+                std::cerr << "[input] could not open joystick " << id << ": " << SDL_GetError() << std::endl;
+                return;
+            }
+            int slot = -1;
+            for (int i = 0; i < kMaxDevices && slot < 0; ++i)
+                if (!g_devices[static_cast<size_t>(i)].gamepad && !g_devices[static_cast<size_t>(i)].joystick)
+                    slot = i;
+            if (slot < 0)
+            {
+                SDL_CloseJoystick(joystick);
+                return;
+            }
+            Device &device = g_devices[static_cast<size_t>(slot)];
+            device = Device{};
+            device.joystick = joystick;
+            device.id = id;
+            const char *name = SDL_GetJoystickName(joystick);
+            device.name = name ? name : "Joystick";
+            std::cerr << "[input] SDL-" << slot << ": " << device.name << " (raw joystick)" << std::endl;
+        }
+
         void removeGamepad(SDL_JoystickID id)
         {
             for (size_t i = 0; i < g_devices.size(); ++i)
             {
                 Device &device = g_devices[i];
-                if (device.gamepad && device.id == id)
+                if ((device.gamepad || device.joystick) && device.id == id)
                 {
                     std::cerr << "[input] SDL-" << i << " disconnected: " << device.name << std::endl;
-                    SDL_CloseGamepad(device.gamepad);
+                    if (device.gamepad)
+                        SDL_CloseGamepad(device.gamepad);
+                    if (device.joystick)
+                        SDL_CloseJoystick(device.joystick);
                     device = Device{};
                 }
             }
@@ -199,6 +264,33 @@ namespace ps2_host_gamepads
             }
             std::cerr << "[input] controllers through SDL " << SDL_MAJOR_VERSION << "." << SDL_MINOR_VERSION << "."
                       << SDL_MICRO_VERSION << std::endl;
+            // STAR 2026-11-27: a test's unmapped joystick (ps2_host_gamepads.h). Its type is not "gamepad", so SDL
+            // gives it no mapping: it arrives as a raw joystick, as a generic USB controller does.
+            if (const char *test = std::getenv("PS2X_TEST_JOYSTICK"); test && *test)
+            {
+                std::string names(test);
+                for (size_t at = 0; at <= names.size();)
+                {
+                    const size_t bar = std::min(names.find('|', at), names.size());
+                    const std::string name = names.substr(at, bar - at);
+                    at = bar + 1;
+                    if (name.empty())
+                        continue;
+                    SDL_VirtualJoystickDesc desc;
+                    SDL_INIT_INTERFACE(&desc);
+                    desc.type = SDL_JOYSTICK_TYPE_UNKNOWN;
+                    desc.naxes = 6;
+                    desc.nbuttons = 16;
+                    desc.nhats = 1;
+                    desc.name = name.c_str();
+                    const SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
+                    SDL_Joystick *joystick = id ? SDL_OpenJoystick(id) : nullptr;
+                    g_testJoystick.store(joystick, std::memory_order_release);
+                    if (!g_testJoystickFirst.load(std::memory_order_relaxed))
+                        g_testJoystickFirst.store(joystick, std::memory_order_release);
+                    std::cerr << "[input] test joystick \"" << name << "\": " << (joystick ? "attached" : SDL_GetError()) << std::endl;
+                }
+            }
             return true;
         }
 
@@ -266,10 +358,14 @@ namespace ps2_host_gamepads
             SDL_Event event;
             while (SDL_PollEvent(&event))
             {
-                if (event.type == SDL_EVENT_GAMEPAD_ADDED)
+                if (event.type == SDL_EVENT_JOYSTICK_ADDED)
+                    addJoystick(event.jdevice.which);
+                else if (event.type == SDL_EVENT_GAMEPAD_ADDED)
                     addGamepad(event.gdevice.which);
                 else if (event.type == SDL_EVENT_GAMEPAD_REMOVED)
                     removeGamepad(event.gdevice.which);
+                else if (event.type == SDL_EVENT_JOYSTICK_REMOVED)
+                    removeGamepad(event.jdevice.which);
             }
             updateRumble();
             return;
@@ -290,7 +386,8 @@ namespace ps2_host_gamepads
             return false;
 #if defined(PS2X_HAS_SDL3)
         if (g_sdl)
-            return g_devices[static_cast<size_t>(device)].gamepad != nullptr;
+            return g_devices[static_cast<size_t>(device)].gamepad != nullptr ||
+                   g_devices[static_cast<size_t>(device)].joystick != nullptr;
 #endif
         return glfwJoystickIsGamepad(device) != 0;
     }
@@ -325,6 +422,84 @@ namespace ps2_host_gamepads
         return kGlfwButtons[static_cast<size_t>(button)] >= 0 && glfwJoystickIsGamepad(device) != 0;
     }
 
+    int rawButtonCount(int device)
+    {
+        if (device < 0 || device >= kMaxDevices)
+            return 0;
+#if defined(PS2X_HAS_SDL3)
+        if (g_sdl)
+        {
+            SDL_Joystick *joystick = g_devices[static_cast<size_t>(device)].joystick;
+            return joystick ? std::min(SDL_GetNumJoystickButtons(joystick), kRawHatBase - kRawButtonBase) : 0;
+        }
+#endif
+        return 0;
+    }
+
+    bool rawButton(int device, int button)
+    {
+        if (device < 0 || device >= kMaxDevices || button < 0 || button >= rawButtonCount(device))
+            return false;
+#if defined(PS2X_HAS_SDL3)
+        SDL_Joystick *joystick = g_devices[static_cast<size_t>(device)].joystick;
+        return joystick && SDL_GetJoystickButton(joystick, button);
+#else
+        return false;
+#endif
+    }
+
+    int rawAxisCount(int device)
+    {
+        if (device < 0 || device >= kMaxDevices)
+            return 0;
+#if defined(PS2X_HAS_SDL3)
+        if (g_sdl)
+        {
+            SDL_Joystick *joystick = g_devices[static_cast<size_t>(device)].joystick;
+            return joystick ? std::min(SDL_GetNumJoystickAxes(joystick), kRawHatBase - kRawAxisBase) : 0;
+        }
+#endif
+        return 0;
+    }
+
+    float rawAxis(int device, int axis)
+    {
+        if (device < 0 || device >= kMaxDevices || axis < 0 || axis >= rawAxisCount(device))
+            return 0.0f;
+#if defined(PS2X_HAS_SDL3)
+        SDL_Joystick *joystick = g_devices[static_cast<size_t>(device)].joystick;
+        return joystick ? std::clamp(static_cast<float>(SDL_GetJoystickAxis(joystick, axis)) / 32767.0f, -1.0f, 1.0f) : 0.0f;
+#else
+        return 0.0f;
+#endif
+    }
+
+    int rawHatCount(int device)
+    {
+        if (device < 0 || device >= kMaxDevices)
+            return 0;
+#if defined(PS2X_HAS_SDL3)
+        if (g_sdl)
+        {
+            SDL_Joystick *joystick = g_devices[static_cast<size_t>(device)].joystick;
+            return joystick ? std::min(SDL_GetNumJoystickHats(joystick), (32767 - kRawHatBase) / 8) : 0;
+        }
+#endif
+        return 0;
+    }
+
+    bool rawHat(int device, int hat, unsigned char direction)
+    {
+        if (device < 0 || device >= kMaxDevices || hat < 0 || hat >= rawHatCount(device) || direction == 0)
+            return false;
+#if defined(PS2X_HAS_SDL3)
+        SDL_Joystick *joystick = g_devices[static_cast<size_t>(device)].joystick;
+        return joystick && (SDL_GetJoystickHat(joystick, hat) & direction) == direction;
+#else
+        return false;
+#endif
+    }
+
     float axis(int device, Axis axis)
     {
         if (device < 0 || device >= kMaxDevices || axis < 0 || axis >= AxisCount)
@@ -354,6 +529,42 @@ namespace ps2_host_gamepads
         auto motor = [](float value)
         { return static_cast<uint16_t>(std::clamp(value, 0.0f, 1.0f) * 65535.0f + 0.5f); };
         g_devices[static_cast<size_t>(device)].wanted = {motor(large), motor(small)};
+    }
+
+    // STAR 2026-11-27 (ps2_host_gamepads.h)
+    bool isRaw(int device)
+    {
+#if defined(PS2X_HAS_SDL3)
+        return device >= 0 && device < kMaxDevices && g_sdl && g_devices[static_cast<size_t>(device)].joystick != nullptr;
+#else
+        (void)device;
+        return false;
+#endif
+    }
+
+    std::string name(int device)
+    {
+        return connected(device) ? g_devices[static_cast<size_t>(device)].name : std::string();
+    }
+
+    void testJoystick(int kind, int index, int value)
+    {
+#if defined(PS2X_HAS_SDL3)
+        SDL_Joystick *joystick = (kind >= 10 ? g_testJoystickFirst : g_testJoystick).load(std::memory_order_acquire);
+        if (!joystick)
+            return;
+        kind %= 10;
+        if (kind == 0)
+            SDL_SetJoystickVirtualButton(joystick, index, value != 0);
+        else if (kind == 1)
+            SDL_SetJoystickVirtualAxis(joystick, index, static_cast<Sint16>(std::clamp(value, -32768, 32767)));
+        else if (kind == 2)
+            SDL_SetJoystickVirtualHat(joystick, index, static_cast<Uint8>(value));
+#else
+        (void)kind;
+        (void)index;
+        (void)value;
+#endif
     }
 
     std::vector<DeviceInfo> devices()

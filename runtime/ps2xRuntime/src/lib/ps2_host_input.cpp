@@ -117,6 +117,11 @@ namespace ps2_host_input
             "Paddle2", "Paddle3", "Paddle4", "Touchpad"};
         constexpr std::array<std::string_view, ps2_host_gamepads::AxisCount> kSdlAxisNames{
             "LeftX", "LeftY", "RightX", "RightY", "LeftTrigger", "RightTrigger"};
+        constexpr std::array<std::string_view, 8> kRawHatDirections{
+            "North", "NorthEast", "East", "SouthEast", "South", "SouthWest", "West", "NorthWest"};
+        constexpr std::array<std::string_view, 8> kRawHatAliases{
+            "Up", "UpRight", "Right", "DownRight", "Down", "DownLeft", "Left", "UpLeft"};
+        constexpr std::array<unsigned char, 8> kRawHatMasks{1u, 3u, 2u, 6u, 4u, 12u, 8u, 9u};
 
         std::string lowerName(std::string_view text)
         {
@@ -124,6 +129,28 @@ namespace ps2_host_input
             for (char &ch : name)
                 ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             return name;
+        }
+
+        std::optional<int> oneBasedElement(std::string_view text, std::string_view prefix, int limit)
+        {
+            if (text.size() <= prefix.size() || lowerName(text.substr(0, prefix.size())) != lowerName(prefix))
+                return std::nullopt;
+            text.remove_prefix(prefix.size());
+            while (!text.empty() && text.front() == ' ')
+                text.remove_prefix(1u);
+            if (text.empty())
+                return std::nullopt;
+            int number = 0;
+            for (char ch : text)
+            {
+                if (!std::isdigit(static_cast<unsigned char>(ch)))
+                    return std::nullopt;
+                const int digit = ch - '0';
+                if (number > (limit - digit) / 10)
+                    return std::nullopt;
+                number = number * 10 + digit;
+            }
+            return number > 0 ? std::optional<int>(number) : std::nullopt;
         }
 
         std::string_view trimView(std::string_view text)
@@ -159,7 +186,7 @@ namespace ps2_host_input
             return std::nullopt;
         }
 
-        // "Keyboard/W", "Pointer-0/LeftButton", "SDL-0/FaceSouth", "SDL-0/+LeftTrigger", "SDL-1/-LeftY".
+        // "Keyboard/W", "Pointer-0/LeftButton", SDL gamepad elements, and numbered raw joystick elements.
         std::optional<Element> parseElement(std::string_view text)
         {
             text = trimView(text);
@@ -214,7 +241,12 @@ namespace ps2_host_input
                         return element;
                     }
                 }
-                return std::nullopt;
+                if (const auto rawAxis =
+                        oneBasedElement(name, "Axis", ps2_host_gamepads::kRawHatBase - ps2_host_gamepads::kRawAxisBase))
+                    element.code = ps2_host_gamepads::kRawAxisBase + *rawAxis - 1;
+                else
+                    return std::nullopt;
+                return element;
             }
             element.source = Source::PadButton;
             for (size_t i = 0; i < kSdlButtonNames.size(); ++i)
@@ -224,6 +256,40 @@ namespace ps2_host_input
                     element.code = static_cast<int>(i);
                     return element;
                 }
+            }
+            if (const auto rawButton =
+                    oneBasedElement(name, "Button", ps2_host_gamepads::kRawHatBase - ps2_host_gamepads::kRawButtonBase))
+            {
+                element.code = ps2_host_gamepads::kRawButtonBase + *rawButton - 1;
+                return element;
+            }
+            const std::string lower = lowerName(name);
+            if (lower.rfind("hat", 0) == 0)
+            {
+                size_t split = 3u;
+                while (split < lower.size() && lower[split] == ' ')
+                    ++split;
+                const size_t numberStart = split;
+                while (split < lower.size() && std::isdigit(static_cast<unsigned char>(lower[split])))
+                    ++split;
+                if (split == numberStart)
+                    return std::nullopt;
+                constexpr int kMaxHatNumber = (32767 - ps2_host_gamepads::kRawHatBase) / 8;
+                const auto hatNumber = oneBasedElement(std::string_view(lower).substr(0, split), "Hat", kMaxHatNumber);
+                if (!hatNumber)
+                    return std::nullopt;
+                const int hat = *hatNumber - 1;
+                while (split < lower.size() && lower[split] == ' ')
+                    ++split;
+                if (split == lower.size())
+                    return std::nullopt;
+                const std::string_view direction(lower.data() + split, lower.size() - split);
+                for (size_t i = 0; i < kRawHatDirections.size(); ++i)
+                    if (direction == lowerName(kRawHatDirections[i]) || direction == lowerName(kRawHatAliases[i]))
+                    {
+                        element.code = ps2_host_gamepads::kRawHatBase + hat * 8 + static_cast<int>(i);
+                        return element;
+                    }
             }
             return std::nullopt;
         }
@@ -562,6 +628,16 @@ namespace ps2_host_input
         // (mapDevice). -1: no swap. Window thread.
         int g_activePad = -1;
         std::array<uint32_t, ps2_host_gamepads::kMaxDevices> g_padHeld{};
+        // STAR 2026-11-27 (setRawJoystickName): the unmapped joystick the player set up, the devices of that name
+        // (bit d; every device while no name is set), and what was held on each at the last sample.
+        std::mutex g_rawNameMutex;
+        std::string g_rawNameWanted;               // g_rawNameMutex
+        std::atomic<bool> g_rawNameChanged{false};
+        std::string g_rawName;                     // window thread
+        uint32_t g_rawUsable = ~0u;                // window thread
+        std::array<uint64_t, ps2_host_gamepads::kMaxDevices> g_rawHeld{};
+        std::array<bool, ps2_host_gamepads::kMaxDevices> g_rawSeen{};
+        bool rawUsable(int device) { return device >= 0 && device < 32 && ((g_rawUsable >> device) & 1u) != 0u; }
         int mapDevice(int device)
         {
             if (g_activePad < 0 || g_extraDevice < 0)
@@ -648,6 +724,7 @@ namespace ps2_host_input
         constexpr std::array<std::string_view, ps2_host_gamepads::AxisCount * 2> kPromptPadAxes{
             "LS\xE2\x86\x90", "LS\xE2\x86\x92", "LS\xE2\x86\x91", "LS\xE2\x86\x93", "RS\xE2\x86\x90", "RS\xE2\x86\x92",
             "RS\xE2\x86\x91", "RS\xE2\x86\x93", "LT-", "LT", "RT-", "RT"};
+        constexpr std::array<const char *, 8> kPromptRawHatDirections{"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
 
         void copyLabel(char (&out)[prompts::kLabelBytes], std::string_view text)
         {
@@ -704,17 +781,40 @@ namespace ps2_host_input
             case Source::PadButton:
                 binding.type = prompts::Type::PadButton;
                 binding.device = static_cast<int8_t>(element.device);
-                label = kPromptPadButtons[static_cast<size_t>(element.code)];
-                if (element.code == ps2_host_gamepads::Guide)
-                    compact = "Gde"; // the two names over the compact limit of 4 characters
-                else if (element.code == ps2_host_gamepads::Touchpad)
-                    compact = "TPad";
+                if (element.code >= 0 && element.code < static_cast<int>(kPromptPadButtons.size()))
+                {
+                    label = kPromptPadButtons[static_cast<size_t>(element.code)];
+                    if (element.code == ps2_host_gamepads::Guide)
+                        compact = "Gde"; // the two names over the compact limit of 4 characters
+                    else if (element.code == ps2_host_gamepads::Touchpad)
+                        compact = "TPad";
+                }
+                else if (element.code >= ps2_host_gamepads::kRawButtonBase &&
+                         element.code < ps2_host_gamepads::kRawHatBase)
+                {
+                    std::snprintf(full, sizeof(full), "B%d", element.code - ps2_host_gamepads::kRawButtonBase + 1);
+                    label = compact = full;
+                }
+                else if (element.code >= ps2_host_gamepads::kRawHatBase && element.code < 32767)
+                {
+                    const int code = element.code - ps2_host_gamepads::kRawHatBase;
+                    std::snprintf(full, sizeof(full), "H%d%s", code / 8 + 1, kPromptRawHatDirections[code % 8]);
+                    label = compact = full;
+                }
                 break;
             case Source::PadAxis:
                 binding.type = prompts::Type::PadAxis;
                 binding.device = static_cast<int8_t>(element.device);
                 binding.sign = element.sign < 0.0f ? int8_t{-1} : int8_t{1};
-                label = kPromptPadAxes[static_cast<size_t>(element.code) * 2u + (element.sign < 0.0f ? 0u : 1u)];
+                if (element.code >= 0 && element.code < ps2_host_gamepads::AxisCount)
+                    label = kPromptPadAxes[static_cast<size_t>(element.code) * 2u + (element.sign < 0.0f ? 0u : 1u)];
+                else if (element.code >= ps2_host_gamepads::kRawAxisBase &&
+                         element.code < ps2_host_gamepads::kRawHatBase)
+                {
+                    std::snprintf(full, sizeof(full), "A%d%c", element.code - ps2_host_gamepads::kRawAxisBase + 1,
+                                  element.sign < 0.0f ? '-' : '+');
+                    label = compact = full;
+                }
                 break;
             }
             copyLabel(binding.label, label);
@@ -1030,6 +1130,20 @@ namespace ps2_host_input
         void updateActivePad()
         {
             namespace gp = ps2_host_gamepads;
+            // STAR 2026-11-27 (setRawJoystickName): the joysticks whose numbered elements are read
+            if (g_rawNameChanged.exchange(false, std::memory_order_acquire))
+            {
+                std::lock_guard<std::mutex> lock(g_rawNameMutex);
+                g_rawName = g_rawNameWanted;
+            }
+            g_rawUsable = ~0u;
+            if (!g_rawName.empty())
+            {
+                g_rawUsable = 0u;
+                for (int d = 0; d < gp::kMaxDevices; ++d)
+                    if (gp::isRaw(d) && gp::name(d) == g_rawName)
+                        g_rawUsable |= 1u << d;
+            }
             if (g_activePad >= 0 && !gp::connected(g_activePad))
             {
                 g_activePad = -1;
@@ -1050,11 +1164,47 @@ namespace ps2_host_input
                 }
                 const uint32_t pressed = held & ~g_padHeld[static_cast<size_t>(d)];
                 g_padHeld[static_cast<size_t>(d)] = held;
-                if (pressed != 0u && g_extraDevice >= 0 && d != playerOneDevice())
+                // STAR 2026-11-27: the set-up joystick's buttons, hats and axes count as a gamepad's buttons do. What
+                // is held when it is first seen (a trigger resting at one end) is no press.
+                bool rawPressed = false;
+                if (!g_rawName.empty() && rawUsable(d))
+                {
+                    uint64_t raw = 0u;
+                    for (int b = 0, n = std::min(gp::rawButtonCount(d), 40); b < n; ++b)
+                        if (gp::rawButton(d, b))
+                            raw |= uint64_t{1} << b;
+                    for (int h = 0, n = std::min(gp::rawHatCount(d), 2); h < n; ++h)
+                        for (int side = 0; side < 4; ++side)
+                            if (gp::rawHat(d, h, static_cast<unsigned char>(1u << side)))
+                                raw |= uint64_t{1} << (40 + h * 4 + side);
+                    for (int a = 0, n = std::min(gp::rawAxisCount(d), 8); a < n; ++a)
+                        if (const float v = gp::rawAxis(d, a); std::fabs(v) > 0.6f)
+                            raw |= uint64_t{1} << (48 + a * 2 + (v < 0.0f ? 1 : 0));
+                    rawPressed = g_rawSeen[static_cast<size_t>(d)] && (raw & ~g_rawHeld[static_cast<size_t>(d)]) != 0u;
+                    g_rawHeld[static_cast<size_t>(d)] = raw;
+                    g_rawSeen[static_cast<size_t>(d)] = true;
+                }
+                else
+                    g_rawSeen[static_cast<size_t>(d)] = false;
+                if ((pressed != 0u || rawPressed) && g_extraDevice >= 0 && d != playerOneDevice())
                 {
                     g_activePad = d == g_extraDevice ? -1 : d;
                     std::cerr << "[input] player 1's controller: #" << d + 1 << " (pressed last)" << std::endl;
                 }
+            }
+            // STAR 2026-11-27: the set-up joystick is player 1's while its place holds no controller it could be (none,
+            // or a joystick of another name: a wheel found first).
+            if (!g_rawName.empty() && g_extraDevice >= 0)
+            {
+                const int one = playerOneDevice();
+                if (!(gp::connected(one) && (!gp::isRaw(one) || rawUsable(one))))
+                    for (int d = 0; d < gp::kMaxDevices; ++d)
+                        if (rawUsable(d))
+                        {
+                            g_activePad = d == g_extraDevice ? -1 : d;
+                            std::cerr << "[input] player 1's controller: #" << d + 1 << " (the one set up)" << std::endl;
+                            break;
+                        }
             }
         }
 
@@ -1227,6 +1377,7 @@ namespace ps2_host_input
                    "#   SDL-<n>/<button> (controller n: FaceSouth FaceEast FaceWest FaceNorth Back Start LeftStick RightStick\n"
                    "#   LeftShoulder RightShoulder DPadUp DPadDown DPadLeft DPadRight Paddle1-4) | SDL-<n>/+<axis> or -<axis> (LeftX LeftY\n"
                    "#   RightX RightY LeftTrigger RightTrigger). Repeat a key for more bindings; \"<Key> =\" = unbound; \"a & b\" = both.\n"
+                   "#   Unmapped joysticks: SDL-<n>/Button <n>, +/-Axis <n>, Hat <n> <direction> (element numbers start at 1).\n"
                    "# Keys: Up Right Down Left Triangle Circle Cross Square Select Start L1 L2 R1 R2 L3 R3, LUp LRight LDown LLeft\n"
                    "#   (left stick), RUp RRight RDown RLeft (right stick); settings Type Deadzone AxisScale ButtonDeadzone InvertL InvertR\n"
                    "#   LargeMotor SmallMotor LargeMotorScale SmallMotorScale; Select's and the back paddles' commands SelectCommand\n"
@@ -1919,9 +2070,39 @@ namespace ps2_host_input
                     return 0.0f;
                 return IsWindowFocused() && !g_menuMouse.load(std::memory_order_relaxed) && IsMouseButtonDown(element.code) ? 1.0f : 0.0f;
             case Source::PadButton:
-                return ps2_host_gamepads::button(mapDevice(element.device), static_cast<ps2_host_gamepads::Button>(element.code)) ? 1.0f : 0.0f;
+            {
+                // STAR 2026-11-27 (setRawJoystickName): numbered elements only from the joystick set up
+                if (element.code >= ps2_host_gamepads::kRawButtonBase && !rawUsable(mapDevice(element.device)))
+                    return 0.0f;
+                if (element.code >= ps2_host_gamepads::kRawHatBase)
+                {
+                    const int code = element.code - ps2_host_gamepads::kRawHatBase;
+                    return ps2_host_gamepads::rawHat(mapDevice(element.device), code / 8,
+                                                     kRawHatMasks[static_cast<size_t>(code % 8)])
+                               ? 1.0f
+                               : 0.0f;
+                }
+                if (element.code >= ps2_host_gamepads::kRawButtonBase)
+                    return ps2_host_gamepads::rawButton(mapDevice(element.device),
+                                                        element.code - ps2_host_gamepads::kRawButtonBase)
+                               ? 1.0f
+                               : 0.0f;
+                return ps2_host_gamepads::button(mapDevice(element.device),
+                                                 static_cast<ps2_host_gamepads::Button>(element.code))
+                           ? 1.0f
+                           : 0.0f;
+            }
             case Source::PadAxis:
-                return std::max(0.0f, element.sign * ps2_host_gamepads::axis(mapDevice(element.device), static_cast<ps2_host_gamepads::Axis>(element.code)));
+            {
+                if (element.code >= ps2_host_gamepads::kRawAxisBase && !rawUsable(mapDevice(element.device)))
+                    return 0.0f; // STAR 2026-11-27 (setRawJoystickName)
+                const float value = element.code >= ps2_host_gamepads::kRawAxisBase
+                                        ? ps2_host_gamepads::rawAxis(mapDevice(element.device),
+                                                                    element.code - ps2_host_gamepads::kRawAxisBase)
+                                        : ps2_host_gamepads::axis(mapDevice(element.device),
+                                                                  static_cast<ps2_host_gamepads::Axis>(element.code));
+                return std::max(0.0f, element.sign * value);
+            }
             }
             return 0.0f;
         }
@@ -2807,6 +2988,16 @@ namespace ps2_host_input
                                  std::memory_order_relaxed);
     }
 
+    // STAR 2026-11-27 (ps2_input_options.h)
+    void setRawJoystickName(const std::string &name)
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_rawNameMutex);
+            g_rawNameWanted = name;
+        }
+        g_rawNameChanged.store(true, std::memory_order_release);
+    }
+
     void setTabButton(uint16_t button)
     {
         g_tabButton.store(button, std::memory_order_relaxed);
@@ -3057,12 +3248,23 @@ namespace ps2_host_input
                            : element.code == MOUSE_BUTTON_EXTRA ? "Mouse 5"
                                                                 : "Mouse middle";
                 case Source::PadButton:
-                    text = std::string(kPadButtonDisplay[static_cast<size_t>(element.code)]);
+                    if (element.code >= ps2_host_gamepads::kRawHatBase)
+                    {
+                        const int hat = (element.code - ps2_host_gamepads::kRawHatBase) / 8;
+                        const int direction = (element.code - ps2_host_gamepads::kRawHatBase) % 8;
+                        text = "Hat " + std::to_string(hat + 1) + " " + std::string(kRawHatDirections[static_cast<size_t>(direction)]);
+                    }
+                    else if (element.code >= ps2_host_gamepads::kRawButtonBase)
+                        text = "Button " + std::to_string(element.code - ps2_host_gamepads::kRawButtonBase + 1);
+                    else
+                        text = std::string(kPadButtonDisplay[static_cast<size_t>(element.code)]);
                     break;
                 case Source::PadAxis:
                 {
                     const bool negative = element.sign < 0.0f;
-                    switch (element.code)
+                    if (element.code >= ps2_host_gamepads::kRawAxisBase)
+                        text = "Axis " + std::to_string(element.code - ps2_host_gamepads::kRawAxisBase + 1) + (negative ? " -" : " +");
+                    else switch (element.code)
                     {
                     case ps2_host_gamepads::LeftX: text = negative ? "LS left" : "LS right"; break;
                     case ps2_host_gamepads::LeftY: text = negative ? "LS up" : "LS down"; break;
@@ -3291,6 +3493,16 @@ namespace ps2_host_input
 
         std::string padButtonBinding(int device, int button)
         {
+            if (button >= ps2_host_gamepads::kRawHatBase && button < 32767)
+            {
+                const int code = button - ps2_host_gamepads::kRawHatBase;
+                const int direction = code % 8;
+                return "SDL-" + std::to_string(device) + "/Hat " + std::to_string(code / 8 + 1) + " " +
+                       std::string(kRawHatDirections[static_cast<size_t>(direction)]);
+            }
+            if (button >= ps2_host_gamepads::kRawButtonBase && button < ps2_host_gamepads::kRawHatBase)
+                return "SDL-" + std::to_string(device) + "/Button " +
+                       std::to_string(button - ps2_host_gamepads::kRawButtonBase + 1);
             if (button < 0 || button >= ps2_host_gamepads::ButtonCount)
                 return {};
             return "SDL-" + std::to_string(device) + "/" + std::string(kSdlButtonNames[static_cast<size_t>(button)]);
@@ -3298,6 +3510,9 @@ namespace ps2_host_input
 
         std::string padAxisBinding(int device, int axis, bool negative)
         {
+            if (axis >= ps2_host_gamepads::kRawAxisBase && axis < ps2_host_gamepads::kRawHatBase)
+                return "SDL-" + std::to_string(device) + "/" + (negative ? "-" : "+") + "Axis " +
+                       std::to_string(axis - ps2_host_gamepads::kRawAxisBase + 1);
             if (axis < 0 || axis >= ps2_host_gamepads::AxisCount)
                 return {};
             return "SDL-" + std::to_string(device) + "/" + (negative ? "-" : "+") + std::string(kSdlAxisNames[static_cast<size_t>(axis)]);

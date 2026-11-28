@@ -107,6 +107,14 @@ Rules learned the hard way:
 - **The shader table.** A new `ShaderConvert` entry in the renderer must also be listed in `HasColorOutput`
   (`GSDevice.h`), or its pass writes no colour.
 
+**Taking a change from God Hand: Rearmed.** `runtime/` and `thirdparty/pcsx2-gs/` began as its copies at its commit
+`c329b9c` and have STAR's own changes on top, so its patches do not apply as they are (and `git apply` trips over
+the line endings). `tools/merge_upstream.py <base> <theirs> <paths> [--write]` does a three-way merge per file from
+a clone in `upstream/God-Hand-Rearmed`, setting CRLF aside and putting it back. Most of its newer commits rewrite
+God Hand's own functions and are of no use here; what touches the shared code is worth a look. Taken so far: the
+shader warm-up (`94992e1`, `b380c09`) and unmapped SDL joysticks (`1ebd8fd`, `57019bf`, without `touchpad()`, which
+belongs to another change of theirs).
+
 ## 3. Fixes made to the runtime for this game
 
 These were faults of the runtime that this game exposed. Any other game on the same runtime would meet them too.
@@ -380,6 +388,38 @@ become player 1's key bindings in the runtime, so they work in the game's menus;
 by the mouse code. A recorded regression of scripted clicks in all three swing styles guards this code: see
 section 8.
 
+### Controllers the program does not know (`pad_map.cpp`)
+
+SDL knows most controllers as gamepads, with named buttons; those play with the fixed layout in `main.cpp`
+(`kBindings`) and cannot be remapped: the game's own control types are the way to choose what a button does. A
+controller SDL has no mapping for (many generic USB ones) arrives as a raw joystick with numbered buttons, axes and
+hats, and pressed nothing before. For those only, the launcher's Gameplay tab offers "Set up its buttons": each
+button and stick of the PS2 controller is given one of the controller's own (click a row and press it, or go through
+all in order). A stick's row takes an axis and binds both of its directions.
+
+- The settings file keeps it as `joy_device = <name>` and `joy_<button> = Button 3` / `Hat 1 North` / `-Axis 2`.
+  The lines are only written once a controller has been set up. One set-up is kept.
+- At start each becomes a runtime binding (`SDL-0/Button 3`) added to player 1's, beside the gamepad's and under the
+  same device number.
+- `ps2_host_input::setRawJoystickName` tells the runtime the controller's name. Numbered elements are then read
+  from joysticks of that name only (a wheel or flight stick beside it presses nothing), a press on it makes it
+  player 1's controller as a gamepad's button does, and it is player 1's from the start when no gamepad is there.
+- A trigger that rests at one end of its axis is judged against where it rested when the set-up began, and in play
+  counts from half way.
+- There is no vibration on these controllers.
+
+It can be tested without the hardware: `PS2X_TEST_JOYSTICK=<name>` attaches a virtual unmapped joystick (16
+buttons, 6 axes, 1 hat), pressed by script in the launcher (`STAR_LAUNCHER_JOY`) and in play (`STAR_JOY_TEST`,
+whose `[joy]` lines tell what the game's pad read).
+
+### Shader warm-up
+
+Taken from God Hand: Rearmed. Every pipeline the renderer builds is noted in `shadercache_pcsx2/star_warm_vulkan.bin`
+(`star_warm_dx11.bin`); at the next start whatever the caches lack is built on worker threads before play, instead of
+stalling the first time each effect appears. A list shipped as `resources/gs_warm/<api>.bin` would do the same for a
+first run (`tools/gs/warm_merge.py` merges lists); none is shipped yet. Entries carry a hash of the graphics card's
+features, so a list only helps cards with the same features. `PS2X_GS_WARMUP=0` switches it off.
+
 ### The launcher and the settings table
 
 `options.cpp` holds every setting once: its name in the file, where it shows, wording, choices, default, and what
@@ -400,7 +440,7 @@ view meets the ground. It calls the game's own functions from the game thread.
 - **A second monitor with another refresh rate:** the pacing asks Windows for the compositor's (primary) screen. A
   window on a second monitor with a different rate is paced to the wrong grid.
 - **The first run stalls briefly** (0.5-0.8 s in the first seconds, and the first time each effect appears) while
-  shaders compile. Later runs use the cache.
+  shaders compile. Later runs use the cache, and build what it lacks before play (the shader warm-up, section 5).
 - **Very fast flicks** (from about 380 degrees a second): the view's speed dips for two or three frames mid-flick.
 - **In-between pictures leave out** 2D effects the game projects itself and texture animation; those step at 30.
 - **Menu and movie animation stays at the game's own rate.** Only 3D scenes get in-between pictures.
@@ -463,7 +503,9 @@ Switches used most (environment variables; hundreds more are named in code comme
 | `PS2X_GS_RENDERER=native` + `PS2X_GS_TRACE=<tick>:<count>:<file>` | A list of every draw of a frame |
 | `PS2X_GAME_MENU_OPEN_AT=<ticks>`, `STAR_MENU_PAGE_FIRST=<page>` | Open the F2 menu by itself on a page |
 | `STAR_SETTINGS=<file>` | Another settings file, so a test never touches the player's |
-| `STAR_LAUNCHER_SHOT=<png>` (+ `_PAGE`, `_SCROLL`, `_PRESET`, `_SET`, `_CONTROLS`, `_BIND`) | Pictures and actions in the launcher |
+| `STAR_LAUNCHER_SHOT=<png>` (+ `_PAGE`, `_SCROLL`, `_PRESET`, `_SET`, `_CONTROLS`, `_BIND`, `_PAD`, `_JOY`, `_SHOT_AT`) | Pictures and actions in the launcher |
+| `PS2X_TEST_JOYSTICK=<name>[\|<name>]` | A virtual controller SDL does not know (several: in that order) |
+| `STAR_JOY_TEST=<from>-<to>:<kind>:<index>:<value>,...` | Its buttons (kind 0), axes (1) and hat (2) by script, per game frame; `[joy]` lines |
 | `STAR_DEBUG_TEST=<frame>:give:<item>:<n>,<frame>:go:<map>:<x>:<y>:<z>,<frame>:creature:<kind>` | The Debug page's actions by script |
 
 The play log is the first thing to read in any report: a `[stutter]` line for every late vblank says where the
@@ -496,7 +538,8 @@ Traps in testing:
 `STAR settings.ini` sits next to the program. Every line is `name = value`; the launcher and the F2 menu rewrite
 lines in place and keep the comments. `tools/stage_settings.sh` stages the file for a commit with every value at its
 default, so a developer's own values never go into git; keep its list in step with the defaults in
-`src/star/options.cpp` and `src/star/bindings.cpp`.
+`src/star/options.cpp` and `src/star/bindings.cpp`, and with the entries of `src/star/pad_map.cpp` (a controller's
+set-up is staged empty).
 
 Presets (Original, Remastered, STAR) are defined by the `presets` column of the options table. The launcher keeps
 the chosen one in `preset =`; any change of any setting makes it Custom.

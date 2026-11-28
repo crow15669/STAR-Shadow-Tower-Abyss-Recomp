@@ -306,11 +306,13 @@ namespace star::options
                 continue;
             std::string value = line.substr(equals + 1);
             // a note after the value ('#' or ';'), except in the disc image's path, where both can be part of a name
+            // (and in a controller's name, star/pad_map.h: kept as written too, since the runtime looks for that name)
             const std::string name = lower(trim(line.substr(0, equals)));
-            if (name != "disc_image")
+            const bool asWritten = name == "disc_image" || name == "joy_device";
+            if (!asWritten)
                 if (const size_t note = value.find_first_of("#;"); note != std::string::npos)
                     value.erase(note);
-            values[name] = name == "disc_image" ? trim(value) : lower(trim(value));
+            values[name] = asWritten ? trim(value) : lower(trim(value));
         }
         return values;
     }

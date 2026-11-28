@@ -35,6 +35,7 @@ extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void *process, u
 #include "star/play_log.h"
 #include <cstdarg>
 #include "star/bindings.h"
+#include "star/pad_map.h"
 #if defined(STAR_HAS_LAUNCHER)
 #include "star/launcher.h"
 #endif
@@ -166,6 +167,8 @@ namespace
                 continue; // the launcher's (the disc image to show, the player's own preset, the preset chosen)
             if (name.rfind("bind_", 0) == 0)
                 continue; // the mouse and keyboard controls (star/bindings.h: read for the bindings below)
+            if (name.rfind("joy_", 0) == 0)
+                continue; // a controller's set-up (star/pad_map.h: read for the bindings below)
             entries.push_back({name, value});
         }
         for (const star::options::Option &one : star::options::table())
@@ -612,6 +615,11 @@ int main(int argc, char *argv[])
     star::bindings::Binds binds = star::bindings::defaults();
     if (readSettings)
         binds = star::bindings::fromValues(star::options::readFile(g_settingsFile));
+    // STAR 2026-11-27: the set-up of a controller SDL does not know as a gamepad (star/pad_map.h): the file's joy_ lines
+    star::padmap::Map padMap;
+    if (readSettings)
+        padMap = star::padmap::fromValues(star::options::readFile(g_settingsFile));
+    star::padmap::setLive(padMap);
     std::string swings = "buttons";
     if (const char *v = std::getenv("STAR_MELEE_SWINGS"); v && *v)
         swings = v;
@@ -733,12 +741,23 @@ int main(int argc, char *argv[])
             {
                 // the keys of the actions the player can rebind (star/bindings.h): theirs, with the controller's
                 std::string value = binding[1];
+                bool anAction = false;
                 for (const star::bindings::Action &action : star::bindings::actions())
                     if (action.padKey && std::string("PS2X_PAD1_") + action.padKey == binding[0])
-                        value = star::bindings::envValue(binds, swings, action);
+                    {
+                        value = star::bindings::envValue(binds, swings, action); // (with the set-up controller's)
+                        anAction = true;
+                    }
+                // the buttons and sticks of a controller the player set up (star/pad_map.h), beside the gamepad's
+                if (!anAction && std::strlen(binding[0]) > 10)
+                    if (const std::string joystick = star::padmap::liveEnvPart(binding[0] + 10); !joystick.empty())
+                        value += ";" + joystick;
                 setDefaultEnv(binding[0], value.c_str());
             }
         star::bindings::setLive(binds, swings, false);
+        if (star::padmap::count(padMap) > 0)
+            say("controller set-up for \"" + padMap.device + "\": " + std::to_string(star::padmap::count(padMap)) + " of " +
+                std::to_string(star::padmap::entries().size()) + " buttons and sticks");
         std::string controls;
         for (const star::bindings::Action &action : star::bindings::actions())
             controls += (controls.empty() ? "" : "; ") + std::string(action.id) + " = " + star::bindings::encode(binds[action.id]);

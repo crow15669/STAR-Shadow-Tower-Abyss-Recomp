@@ -59,6 +59,8 @@ namespace star::options
 
     // The mouse and keyboard controls (star/bindings.h) are listed under this option (launcher and F2).
     constexpr const char *kControlsUnder = "mouse_keyboard";
+    // The set-up of a controller the program does not know (star/pad_map.h) is offered under this option (launcher).
+    constexpr const char *kPadSetupUnder = "late_input";
     const Option &option(const char *key); // (a name not in the table is a programming error: aborts)
     // The label of a value ("" for one that is not among the choices).
     const char *choiceLabel(const Option &option, const std::string &value);

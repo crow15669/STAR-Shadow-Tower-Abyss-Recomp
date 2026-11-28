@@ -2,8 +2,10 @@
 
 #include "star/options.h"
 #include "star/bindings.h"
+#include "star/pad_map.h"
 
 #include "runtime/ps2_display_options.h"
+#include "ps2_host_gamepads.h"
 
 #include "raylib.h"
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -11,6 +13,7 @@
 #include "rlImGui.h"
 
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -106,6 +109,18 @@ namespace star::launcher
             size_t captureSlot = 0;      // (its inputs' count: a new one)
             int captureStep = 0;         // 1 waiting for every key and button to go up, 2 listening, 3 taken: waiting again
             std::string controlsNote;    // what the last change took from another action
+            // a controller the program does not know by itself (star/pad_map.h) and its set-up screen
+            padmap::Map padMap;          // the file's
+            bool padLines = false;       // the file has joy_ lines (they are written from then on)
+            bool padWanted = false;      // open the screen (drawPadScreen)
+            std::string padDevice;       // the controller the screen is for, by name
+            std::string padCaptureId;    // the entry whose button is being taken
+            int padCaptureStep = 0;      // 1 waiting for everything on it to be let go, 2 listening, 3 taken: waiting again
+            bool padAll = false;         // every entry in turn
+            std::string padNote;         // what the last change took from another entry
+            std::array<float, 32> padRest{}; // its axes when the taking began (a trigger may rest at one end)
+            int testPad = 0;             // tests: 1 the screen opened at frame 5, 2 and every entry in turn from frame 8
+            std::string testJoy;         // tests: "frame:kind:index:value,...": the test joystick's elements set at frames
         };
 
         float px(const State &state, float size) { return std::round(size * state.unit); }
@@ -135,6 +150,8 @@ namespace star::launcher
                 const std::vector<std::string> &inputs = state.binds[one.id];
                 lines.push_back({std::string("bind_") + one.id, inputs.empty() ? "none" : bindings::encode(inputs)});
             }
+            if (state.padLines)
+                padmap::addLines(state.padMap, lines);
             if (!state.custom.empty())
                 lines.push_back({"custom", options::encodeCustom(state.custom)});
             if (withDisc && !state.disc.empty() && state.discProblem.empty())
@@ -694,6 +711,387 @@ namespace star::launcher
             ImGui::EndPopup();
         }
 
+        // ---- a controller the program does not know by itself: its set-up (star/pad_map.h) ----
+        namespace gp = ps2_host_gamepads;
+
+        // The controllers connected that SDL does not know as gamepads: (device number, name).
+        std::vector<std::pair<int, std::string>> rawControllers()
+        {
+            std::vector<std::pair<int, std::string>> list;
+            for (int device = 0; device < gp::kMaxDevices; ++device)
+                if (gp::isRaw(device))
+                    list.push_back({device, gp::name(device)});
+            return list;
+        }
+
+        int padDeviceNumber(const State &state) // the screen's controller; -1: not connected
+        {
+            for (const auto &[device, name] : rawControllers())
+                if (name == state.padDevice)
+                    return device;
+            return -1;
+        }
+
+        float padMoved(const State &state, int device, int axis)
+        {
+            return gp::rawAxis(device, axis) - state.padRest[static_cast<size_t>(axis)];
+        }
+
+        bool padAnyDown(const State &state, int device)
+        {
+            for (int b = 0; b < gp::rawButtonCount(device); ++b)
+                if (gp::rawButton(device, b))
+                    return true;
+            for (int h = 0; h < gp::rawHatCount(device); ++h)
+                for (int side = 0; side < 4; ++side)
+                    if (gp::rawHat(device, h, static_cast<unsigned char>(1u << side)))
+                        return true;
+            for (int a = 0; a < std::min(gp::rawAxisCount(device), static_cast<int>(state.padRest.size())); ++a)
+                if (std::fabs(padMoved(state, device, a)) > 0.3f)
+                    return true;
+            return false;
+        }
+
+        void endPadCapture(State &state)
+        {
+            state.padCaptureStep = 0;
+            state.padCaptureId.clear();
+            state.padAll = false;
+        }
+
+        void startPadCapture(State &state, const std::string &id, bool all)
+        {
+            const int device = padDeviceNumber(state);
+            if (device < 0)
+                return;
+            state.padCaptureId = id;
+            state.padAll = all;
+            state.padCaptureStep = 1;
+            state.padNote.clear();
+            for (size_t a = 0; a < state.padRest.size(); ++a)
+                state.padRest[a] = static_cast<int>(a) < gp::rawAxisCount(device) ? gp::rawAxis(device, static_cast<int>(a)) : 0.0f;
+        }
+
+        // An entry was taken or passed over: the next one when going through them all.
+        void padCaptureNext(State &state)
+        {
+            if (state.padAll)
+            {
+                const std::vector<padmap::Entry> &all = padmap::entries();
+                for (size_t i = 0; i + 1 < all.size(); ++i)
+                    if (state.padCaptureId == all[i].id)
+                    {
+                        state.padCaptureId = all[i + 1].id;
+                        state.padCaptureStep = 1;
+                        return;
+                    }
+                state.padNote = "That was the last one.";
+            }
+            endPadCapture(state);
+        }
+
+        // Before each frame of the screen: the button, hat or axis for the entry being set. Esc stops.
+        void updatePadCapture(State &state)
+        {
+            if (state.padCaptureStep == 0)
+                return;
+            const int device = padDeviceNumber(state);
+            if (device < 0)
+            {
+                endPadCapture(state);
+                state.padNote = "The controller is no longer connected.";
+                return;
+            }
+            if (IsKeyPressed(KEY_ESCAPE))
+            {
+                endPadCapture(state);
+                return;
+            }
+            if (state.padCaptureStep == 1 || state.padCaptureStep == 3)
+            {
+                if (!padAnyDown(state, device))
+                {
+                    if (state.padCaptureStep == 1)
+                        state.padCaptureStep = 2;
+                    else
+                        padCaptureNext(state);
+                }
+                return;
+            }
+            const padmap::Entry *entry = padmap::entry(state.padCaptureId);
+            if (!entry)
+            {
+                endPadCapture(state);
+                return;
+            }
+            std::string input;
+            if (!entry->opposite) // (a stick's row takes an axis only)
+            {
+                for (int b = 0; input.empty() && b < gp::rawButtonCount(device); ++b)
+                    if (gp::rawButton(device, b))
+                        input = "Button " + std::to_string(b + 1);
+                static const char *const kSides[] = {"North", "East", "South", "West"};
+                for (int h = 0; input.empty() && h < gp::rawHatCount(device); ++h)
+                    for (int side = 0; input.empty() && side < 4; ++side)
+                        if (gp::rawHat(device, h, static_cast<unsigned char>(1u << side)))
+                            input = "Hat " + std::to_string(h + 1) + " " + kSides[side];
+            }
+            if (input.empty())
+            {
+                // the axis moved furthest from where it rested (a stick pushed a little askew moves two)
+                int axis = -1;
+                float most = 0.6f;
+                for (int a = 0; a < std::min(gp::rawAxisCount(device), static_cast<int>(state.padRest.size())); ++a)
+                    if (const float moved = std::fabs(padMoved(state, device, a)); moved > most)
+                    {
+                        most = moved;
+                        axis = a;
+                    }
+                if (axis >= 0)
+                    input = std::string(padMoved(state, device, axis) < 0.0f ? "-" : "+") + "Axis " + std::to_string(axis + 1);
+            }
+            if (input.empty())
+                return;
+            if (state.padMap.device != state.padDevice) // another controller's set-up: this one's replaces it
+            {
+                state.padMap = {};
+                state.padMap.device = state.padDevice;
+            }
+            std::string taken;
+            if (padmap::assign(state.padMap, entry->id, input, taken))
+            {
+                state.padNote = taken;
+                state.padLines = true;
+                save(state, false);
+            }
+            state.padCaptureStep = 3;
+        }
+
+        // Under "Reduced input lag" (Gameplay): only while a controller SDL does not know is connected, or one is set up.
+        bool padSetupShown(const State &state)
+        {
+            return padmap::count(state.padMap) > 0 || !rawControllers().empty();
+        }
+
+        void drawPadSetup(State &state)
+        {
+            const auto raw = rawControllers();
+            const bool saved = padmap::count(state.padMap) > 0;
+            // the controller this is about: the one set up while it is connected, else the first one connected
+            std::string name;
+            bool connected = false;
+            for (const auto &[device, one] : raw)
+                if (saved && one == state.padMap.device)
+                {
+                    name = one;
+                    connected = true;
+                }
+            if (!connected && !raw.empty())
+            {
+                name = raw.front().second;
+                connected = true;
+            }
+            if (!connected)
+                name = state.padMap.device;
+            const bool itsOwn = saved && name == state.padMap.device;
+            ImGui::Dummy(ImVec2(0.0f, px(state, 2.0f)));
+            ImGui::TextWrapped("Controller: %s", name.c_str());
+            if (!connected)
+                note("Its buttons are set up, but it is not connected now.");
+            else if (itsOwn)
+            {
+                const int set = padmap::count(state.padMap), all = static_cast<int>(padmap::entries().size());
+                textColored(kGood, set == all ? "Its buttons are set up."
+                                              : ("Set up: " + std::to_string(set) + " of " + std::to_string(all) + " buttons and sticks.").c_str());
+            }
+            else
+                textColored(kAsk, "The program does not know this controller's buttons by itself. Set them up once to play with it.");
+            if (ImGui::Button(itsOwn ? "Change its buttons..." : "Set up its buttons..."))
+            {
+                state.padWanted = true;
+                state.padDevice = name;
+            }
+            ImGui::Dummy(ImVec2(0.0f, px(state, 8.0f)));
+        }
+
+        // The set-up screen: every button and stick of the PS2 controller, each with the controller's own.
+        void drawPadScreen(State &state)
+        {
+            if (state.padWanted)
+            {
+                ImGui::OpenPopup("##padScreen");
+                state.padWanted = false;
+                state.padNote.clear();
+            }
+            const ImVec2 display = ImGui::GetIO().DisplaySize;
+            ImGui::SetNextWindowSize(ImVec2(std::floor(display.x * 0.86f), std::floor(display.y * 0.88f)));
+            ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(state, 26.0f), px(state, 20.0f)));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.09f, 0.09f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.6f));
+            const bool open = ImGui::BeginPopupModal("##padScreen", nullptr,
+                                                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                                         ImGuiWindowFlags_NoSavedSettings);
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(2);
+            if (!open)
+                return;
+            const bool busy = state.padCaptureStep != 0;
+            const bool connected = padDeviceNumber(state) >= 0;
+            static const padmap::Map kNone;
+            const bool itsOwn = state.padMap.device == state.padDevice;
+            const padmap::Map &map = itsOwn ? state.padMap : kNone;
+            ImGui::PushFont(nullptr, px(state, 30.0f));
+            ImGui::TextUnformatted("Controller set-up");
+            ImGui::PopFont();
+            // the controller: its name, or a choice when several are connected
+            const auto raw = rawControllers();
+            if (raw.size() > 1 && connected)
+            {
+                ImGui::BeginDisabled(busy);
+                ImGui::SetNextItemWidth(std::min(px(state, 460.0f), ImGui::GetContentRegionAvail().x));
+                if (ImGui::BeginCombo("##padDevice", state.padDevice.c_str()))
+                {
+                    for (const auto &[device, name] : raw)
+                        if (ImGui::Selectable((name + "##" + std::to_string(device)).c_str(), name == state.padDevice))
+                        {
+                            state.padDevice = name;
+                            state.padNote.clear();
+                        }
+                    ImGui::EndCombo();
+                }
+                ImGui::EndDisabled();
+            }
+            else
+                textColored(kKey, (state.padDevice + (connected ? "" : " (not connected)")).c_str());
+            note("The program does not know this controller by itself, so it has to be told once which of its buttons is which "
+                 "button of the PlayStation 2 controller. Click a row and press that button on the controller, or go through "
+                 "them all in order. Leave out what the controller does not have. What each button does in the game is still "
+                 "chosen in the game's own options (Control Type).");
+            if (!itsOwn && padmap::count(state.padMap) > 0)
+                textColored(kAsk, ("The set-up kept now is for " + state.padMap.device + ". Setting this controller up replaces it.").c_str());
+            const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetTextLineHeightWithSpacing() * 2.0f + px(state, 8.0f);
+            ImGui::BeginDisabled(busy);
+            if (ImGui::BeginChild("##padRows", ImVec2(0.0f, std::max(ImGui::GetContentRegionAvail().y - footer, px(state, 120.0f)))))
+            {
+                ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(px(state, 10.0f), px(state, 5.0f)));
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.17f, 0.17f, 0.20f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.12f, 0.10f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, kRed);
+                if (ImGui::BeginTable("##padEntries", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH))
+                {
+                    ImGui::TableSetupColumn("button", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+                    ImGui::TableSetupColumn("its own", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+                    std::string group;
+                    for (const padmap::Entry &one : padmap::entries())
+                    {
+                        if (group != one.group)
+                        {
+                            group = one.group;
+                            ImGui::TableNextRow();
+                            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.30f, 0.09f, 0.07f, 0.35f)));
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::TextUnformatted(one.group);
+                        }
+                        const bool taking = busy && state.padCaptureId == one.id;
+                        ImGui::TableNextRow();
+                        if (taking)
+                        {
+                            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.30f, 0.09f, 0.07f, 0.55f)));
+                            ImGui::SetScrollHereY(0.5f);
+                        }
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::Indent(px(state, 14.0f));
+                        ImGui::TextUnformatted(one.label);
+                        if (*one.where)
+                        {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("(%s)", one.where);
+                        }
+                        ImGui::Unindent(px(state, 14.0f));
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::PushID(one.id);
+                        const auto found = map.inputs.find(one.id);
+                        const bool set = found != map.inputs.end() && !found->second.empty();
+                        const std::string label = taking ? (one.opposite ? "Push it now..." : "Press it now...")
+                                                         : set ? padmap::displayName(one, found->second) : "Not set";
+                        ImGui::PushStyleColor(ImGuiCol_Text, taking ? kAsk : set ? kKey : ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+                        ImGui::BeginDisabled(!connected);
+                        if (ImGui::Button(label.c_str(), ImVec2(px(state, 190.0f), 0.0f)))
+                            startPadCapture(state, one.id, false);
+                        ImGui::EndDisabled();
+                        ImGui::PopStyleColor();
+                        if (set && !taking)
+                        {
+                            ImGui::SameLine(0.0f, 2.0f);
+                            if (ImGui::Button("\xC3\x97", ImVec2(ImGui::GetFrameHeight(), 0.0f))) // x: takes it away
+                            {
+                                state.padMap.inputs.erase(one.id);
+                                state.padNote.clear();
+                                save(state, false);
+                            }
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::PopStyleColor(3);
+                ImGui::PopStyleVar();
+            }
+            ImGui::EndChild();
+            ImGui::EndDisabled();
+            // the footer: what is being asked for, what the last change took, and the buttons
+            if (busy)
+            {
+                const padmap::Entry *taking = padmap::entry(state.padCaptureId);
+                std::string ask = taking ? std::string(taking->label) : std::string();
+                if (taking && *taking->where)
+                    ask += std::string(" (") + taking->where + ")";
+                textColored(kAsk, state.padCaptureStep == 2 ? ((taking && taking->opposite ? "Push and hold on the controller: " : "Press on the controller: ") + ask +
+                                                              ". Esc on the keyboard stops.").c_str()
+                                                            : "Let go of everything on the controller...");
+            }
+            else if (!state.padNote.empty())
+                textColored(kAsk, state.padNote.c_str());
+            else
+                note(connected ? "Changes are saved as you make them." : "Connect the controller to change its buttons.");
+            const float done = px(state, 140.0f);
+            const float doneX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - done;
+            if (busy && state.padAll)
+            {
+                if (ImGui::Button("Skip this one"))
+                    padCaptureNext(state);
+                ImGui::SameLine();
+                if (ImGui::Button("Stop"))
+                    endPadCapture(state);
+            }
+            else
+            {
+                ImGui::BeginDisabled(busy || !connected);
+                if (ImGui::Button("Go through them all in order"))
+                    startPadCapture(state, padmap::entries().front().id, true);
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(busy || !itsOwn || padmap::count(state.padMap) == 0);
+                if (ImGui::Button("Clear all"))
+                {
+                    state.padMap.inputs.clear();
+                    state.padNote = "Every button is cleared.";
+                    save(state, false);
+                }
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine(doneX);
+            if (ImGui::Button("Done", ImVec2(done, 0.0f)))
+            {
+                endPadCapture(state);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         void drawPage(State &state, options::Page page)
         {
             // the controls' column: wide enough for the page's longest choice (the gun's "Toggle: press to aim, press
@@ -739,6 +1137,12 @@ namespace star::launcher
                     ImGui::EndTable();
                     drawControls(state);
                     open = openTable(section + "##after");
+                }
+                if (open && std::string(one.key) == options::kPadSetupUnder && padSetupShown(state))
+                {
+                    ImGui::EndTable();
+                    drawPadSetup(state);
+                    open = openTable(section + "##afterPad");
                 }
             }
             if (open)
@@ -790,6 +1194,8 @@ namespace star::launcher
             state.custom = options::decodeCustom(custom->second);
         state.chosen = options::chosenPreset(fromFile, state.values);
         state.binds = bindings::fromValues(fromFile);
+        state.padMap = padmap::fromValues(fromFile);
+        state.padLines = padmap::inValues(fromFile);
         if (state.chosen < 0)
             state.custom = options::decodeCustom(options::encodeCustom(state.values));
         state.disc = disc;
@@ -848,6 +1254,16 @@ namespace star::launcher
             state.testControls = std::atoi(v);
         if (const char *v = std::getenv("STAR_LAUNCHER_BIND"); v && std::strchr(v, '='))
             state.testBind = v;
+        // STAR_LAUNCHER_PAD=1 opens the controller set-up screen at frame 5 (2: and goes through every entry from frame
+        // 8); STAR_LAUNCHER_JOY=<frame>:<kind>:<index>:<value>,... sets the test joystick's elements
+        // (PS2X_TEST_JOYSTICK, ps2_host_gamepads.h) at those frames; STAR_LAUNCHER_SHOT_AT=<frame> takes the picture then.
+        if (const char *v = std::getenv("STAR_LAUNCHER_PAD"); v && *v)
+            state.testPad = std::atoi(v);
+        if (const char *v = std::getenv("STAR_LAUNCHER_JOY"); v && *v)
+            state.testJoy = v;
+        int shotAt = 30;
+        if (const char *v = std::getenv("STAR_LAUNCHER_SHOT_AT"); v && *v)
+            shotAt = std::max(std::atoi(v), 12);
         int frame = 0;
 
         while (!state.done)
@@ -866,6 +1282,22 @@ namespace star::launcher
             }
             state.unit = std::clamp(static_cast<float>(GetScreenHeight()) / 790.0f, 0.75f, 2.0f);
             updateCapture(state);
+            gp::update(); // (the controllers: SDL starts here, and the game keeps it)
+            if (!state.testJoy.empty())
+                for (const char *text = state.testJoy.c_str(); text && *text; text = std::strchr(text, ','), text = text ? text + 1 : nullptr)
+                {
+                    int at = 0, kind = 0, index = 0, value = 0;
+                    if (std::sscanf(text, "%d:%d:%d:%d", &at, &kind, &index, &value) == 4 && at == frame)
+                        gp::testJoystick(kind, index, value);
+                }
+            if (state.testPad > 0 && frame == 5 && !rawControllers().empty())
+            {
+                state.padWanted = true;
+                state.padDevice = rawControllers().front().second;
+            }
+            if (state.testPad == 2 && frame == 8)
+                startPadCapture(state, padmap::entries().front().id, true);
+            updatePadCapture(state);
             BeginDrawing();
             ClearBackground(Color{18, 18, 20, 255});
             rlImGuiBegin();
@@ -896,6 +1328,7 @@ namespace star::launcher
             ImGui::End();
             ImGui::PopStyleVar();
             drawControlsScreen(state);
+            drawPadScreen(state);
             ImGui::PopFont();
             rlImGuiEnd();
             ++frame;
@@ -927,7 +1360,7 @@ namespace star::launcher
                 optionChanged(state);
                 std::printf("[STAR] launcher test: %s set; preset now %d\n", state.testSet.c_str(), state.chosen);
             }
-            if (shot && *shot && frame == 30)
+            if (shot && *shot && frame == shotAt)
             {
                 Image picture = LoadImageFromScreen();
                 const bool saved = ExportImage(picture, shot);
